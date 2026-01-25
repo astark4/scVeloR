@@ -134,7 +134,10 @@ velocity_stochastic <- function(seurat = NULL,
   
   # Add to Seurat if provided
   if (!is.null(seurat) && inherits(seurat, "Seurat")) {
-    seurat@misc$velocity <- result
+    if (is.null(seurat@misc$scVeloR)) {
+      seurat@misc$scVeloR <- list()
+    }
+    seurat@misc$scVeloR$velocity <- result
     return(seurat)
   }
   

@@ -73,13 +73,35 @@ velocity <- function(object,
     )
     
   } else if (mode == "stochastic") {
+    # Get pre-computed moments from misc$scVeloR
+    Ms <- object@misc$scVeloR$Ms
+    Mu <- object@misc$scVeloR$Mu
+    Mss <- object@misc$scVeloR$Mss
+    Mus <- object@misc$scVeloR$Mus
+    conn <- object@misc$scVeloR$neighbors$connectivities
+    
+    # Call velocity_stochastic with correct parameters
+    # Note: velocity_stochastic doesn't accept ..., so don't pass extra args
     object <- velocity_stochastic(
-      object = object,
-      min_r2 = min_r2,
-      n_cores = n_cores,
-      verbose = verbose,
-      ...
+      seurat = object,
+      Ms = Ms,
+      Mu = Mu,
+      Mss = Mss,
+      Mus = Mus,
+      connectivities = conn
     )
+    
+    # Ensure velocity_genes is set
+    if (is.null(object@misc$scVeloR$velocity$velocity_genes)) {
+      # Set velocity genes based on R² threshold
+      r2 <- object@misc$scVeloR$velocity$r2
+      object@misc$scVeloR$velocity$velocity_genes <- which(r2 >= min_r2 & !is.na(r2))
+    }
+    
+    if (verbose) {
+      n_genes <- length(object@misc$scVeloR$velocity$velocity_genes)
+      message(sprintf("  Found %d velocity genes (R² >= %.3f)", n_genes, min_r2))
+    }
     
   } else if (mode == "dynamical") {
     # First run steady-state to identify velocity genes
