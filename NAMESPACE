@@ -10,15 +10,29 @@ export(velocity_steady_state)
 export(velocity_stochastic)
 export(recover_dynamics)
 export(velocity_from_dynamics)
+export(recover_dynamics_multi)
 
-# Dynamics module
+# Dynamics classes (R6)
+export(SplicingDynamics)
+export(BaseDynamics)
+export(DynamicsRecovery)
+export(SecondOrderSteadyStateModel)
+
+# Dynamics module - ODE solutions
 export(unspliced)
 export(spliced)
 export(mRNA)
 export(tau_inv)
 export(tau_inv_u)
+export(vectorize)
+export(assign_tau)
 export(steady_state)
 export(compute_velocity_from_params)
+
+# Divergence computation
+export(compute_divergence)
+export(root_time)
+export(compute_shared_time)
 
 # Preprocessing
 export(filter_genes)
@@ -26,6 +40,7 @@ export(filter_cells)
 export(normalize_layers)
 export(moments)
 export(second_order_moments)
+export(cross_moments)
 export(prepare_velocity)
 
 # Neighbors
@@ -36,16 +51,19 @@ export(get_connectivities)
 export(velocity_graph)
 export(velocity_confidence)
 export(velocity_coherence)
+export(compute_transition_matrix)
 
 # Velocity embedding
 export(velocity_embedding)
 export(velocity_grid)
 export(velocity_streamlines)
 
-# Latent time
+# Latent time and pseudotime
+export(latent_time)
 export(compute_latent_time)
 export(terminal_states)
 export(velocity_pseudotime)
+export(velocity_cell_cycle)
 
 # Gene ranking
 export(rank_velocity_genes)
@@ -56,13 +74,53 @@ export(plot_velocity_stream)
 export(plot_velocity_grid)
 export(plot_phase)
 
+# Data conversion
+export(import_velocity_data)
+export(create_velocity_seurat)
+export(export_velocity_results)
+export(import_from_anndata)
+export(export_to_anndata)
+export(get_embedding)
+export(get_velocity_data)
+
+# C++ exports
+export(unspliced_cpp)
+export(spliced_cpp)
+export(mRNA_cpp)
+export(tau_inv_u_cpp)
+export(vectorize_params_cpp)
+export(compute_squared_dist_cpp)
+export(compute_loss_cpp)
+export(assign_timepoints_cpp)
+export(gaussian_loglikelihood_cpp)
+export(compute_variance_cpp)
+export(compute_velocity_cpp)
+export(compute_velocity_u_cpp)
+export(row_var_cpp)
+export(col_var_cpp)
+export(weighted_corr_cpp)
+export(safe_divide_cpp)
+export(clamp_cpp)
+
+# Cosine similarity C++
+export(compute_cosine_similarity_cpp)
+export(compute_correlation_graph_cpp)
+
+# KNN C++
+export(knn_exact_cpp)
+export(compute_distances_cpp)
+
+# Moments C++
+export(compute_moments_cpp)
+
 # Imports
 import(Matrix)
 import(methods)
+import(R6)
 
 importFrom(Rcpp, sourceCpp)
-importFrom(stats, optim, lm, coef, quantile, sd, median, density, dist, setNames, na.omit)
-importFrom(utils, head, tail)
+importFrom(stats, optim, lm, coef, quantile, sd, median, density, dist, setNames, na.omit, prcomp, var, pchisq, pnorm, scale)
+importFrom(utils, head, tail, packageVersion)
 importFrom(grDevices, colorRampPalette)
 
 # Load compiled C++ code

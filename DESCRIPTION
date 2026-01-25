@@ -33,6 +33,7 @@ Imports:
     Matrix,
     Rcpp (>= 1.0.0),
     RcppArmadillo,
+    R6,
     methods,
     stats,
     utils,

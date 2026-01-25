@@ -1,509 +1,512 @@
-#' @title Latent Time Estimation
-#' @description Compute gene-shared latent time based on dynamical model parameters.
-#' Gene-specific latent timepoints are coupled to a universal gene-shared latent time,
-#' which represents the cell's internal clock based only on transcriptional dynamics.
+#' @title Latent Time Computation
+#' @description Complete implementation of latent_time() function
+#' equivalent to scvelo.tools.velocity_pseudotime.latent_time
 #' @name latent_time
 NULL
 
 #' Compute Latent Time
 #'
-#' @description Compute gene-shared latent time from dynamical model results.
-#' The latent time represents the cell's internal clock and is based only on
-#' its transcriptional dynamics.
+#' @description Computes a shared latent time across all genes by combining
+#' gene-specific time estimates from the dynamical model.
 #'
-#' @param object Seurat object with dynamics fitted
-#' @param min_likelihood Minimum likelihood for gene inclusion
-#' @param min_confidence Confidence threshold for local coherence
-#' @param root_key Key in object metadata for root cells
-#' @param end_key Key in object metadata for end cells
-#' @param t_max Maximum time scale (default NULL, auto-determined)
-#' @param verbose Print progress
-#'
-#' @return Seurat object with latent_time in metadata
+#' @param seurat Seurat object with velocity data
+#' @param vkey Velocity key
+#' @param min_likelihood Minimum likelihood threshold for gene filtering
+#' @param min_confidence Minimum confidence for soft assignment
+#' @param min_corr_diffusion Minimum correlation with diffusion pseudotime
+#' @param weight_diffusion Weight for diffusion pseudotime
+#' @param root_key Key for root cells
+#' @param end_key Key for terminal cells
+#' @param t_max Maximum time
+#' @param copy Return copy
+#' @return Modified Seurat object or latent time vector
 #' @export
-compute_latent_time <- function(object,
-                                 min_likelihood = 0.1,
-                                 min_confidence = 0.75,
-                                 root_key = NULL,
-                                 end_key = NULL,
-                                 t_max = NULL,
-                                 verbose = TRUE) {
+latent_time <- function(seurat = NULL,
+                        vkey = "velocity",
+                        min_likelihood = 0.1,
+                        min_confidence = NULL,
+                        min_corr_diffusion = NULL,
+                        weight_diffusion = NULL,
+                        root_key = NULL,
+                        end_key = NULL,
+                        t_max = NULL,
+                        copy = FALSE) {
   
-  if (is.null(object@misc$scVeloR$dynamics)) {
-    stop("Run recover_dynamics() first")
-  }
-  
-  dynamics <- object@misc$scVeloR$dynamics
-  gene_params <- dynamics$gene_params
-  fit_t <- dynamics$fit_t
-  
-  if (verbose) {
-    message("Computing latent time...")
+  # Check for dynamical model results
+  if (!is.null(seurat) && inherits(seurat, "Seurat")) {
+    if (!"velocity" %in% names(seurat@misc)) {
+      stop("Run velocity() first before computing latent time")
+    }
+    
+    vdata <- seurat@misc$velocity
+    
+    if (is.null(vdata$fit_t)) {
+      stop("Latent time requires dynamical model. Run velocity(mode='dynamical') first.")
+    }
+    
+    fit_t <- vdata$fit_t
+    likelihood <- vdata$gene_params$likelihood
+    gene_names <- vdata$genes
+    
+    # Get connectivity for smoothing
+    connectivities <- NULL
+    if ("RNA_snn" %in% names(seurat@graphs)) {
+      connectivities <- seurat@graphs$RNA_snn
+    }
+  } else if (is.list(seurat)) {
+    # Direct input
+    fit_t <- seurat$fit_t
+    likelihood <- seurat$gene_params$likelihood
+    gene_names <- seurat$genes
+    connectivities <- seurat$connectivities
+  } else {
+    stop("Input must be Seurat object or list with fit_t")
   }
   
   # Filter genes by likelihood
-  valid_genes <- !is.na(gene_params$likelihood)
-  if (!is.null(min_likelihood)) {
-    valid_genes <- valid_genes & (gene_params$likelihood >= min_likelihood)
+  if (!is.null(min_likelihood) && !all(is.na(likelihood))) {
+    valid_genes <- !is.na(likelihood) & (likelihood >= min_likelihood)
+    if (sum(valid_genes) < 10) {
+      warning("Few genes pass likelihood threshold, using all genes")
+      valid_genes <- !is.na(likelihood)
+    }
+    fit_t <- fit_t[, valid_genes, drop = FALSE]
+    gene_names <- gene_names[valid_genes]
   }
   
-  if (sum(valid_genes) < 3) {
-    stop("Too few valid genes for latent time computation")
-  }
+  # Compute shared latent time
+  t_shared <- compute_shared_time(fit_t, norm = TRUE)
   
-  # Get time matrix for valid genes
-  t <- fit_t[, valid_genes, drop = FALSE]
-  
-  # Remove any columns with all NAs
-  valid_cols <- colSums(!is.na(t)) > 0
-  t <- t[, valid_cols, drop = FALSE]
-  
-  # Get connectivity matrix
-  conn <- NULL
-  if (!is.null(object@misc$scVeloR$neighbors$connectivities)) {
-    conn <- object@misc$scVeloR$neighbors$connectivities
-  }
-  
-  # Determine root cells
-  root_cells <- NULL
-  
-  # Sum of times as initial root indicator (cells with lowest sum are early)
-  t_sum <- rowSums(t, na.rm = TRUE)
-  
+  # Root the time
   if (!is.null(root_key)) {
-    if (root_key %in% colnames(object@meta.data)) {
-      root_indicator <- object@meta.data[[root_key]]
-      
-      if (is.numeric(root_indicator)) {
-        # Use cells with highest values
-        root_cells <- which(root_indicator > quantile(root_indicator, 0.95, na.rm = TRUE))
-      } else if (is.logical(root_indicator)) {
-        root_cells <- which(root_indicator)
-      } else {
-        # Assume factor/character, use first level
-        root_cells <- which(root_indicator == levels(factor(root_indicator))[1])
+    if (inherits(seurat, "Seurat") && root_key %in% names(seurat@meta.data)) {
+      root_cells <- which(seurat@meta.data[[root_key]])
+      if (length(root_cells) > 0) {
+        t_root <- mean(t_shared[root_cells])
+        t_shared <- t_shared - t_root
+        t_shared <- pmax(t_shared, 0)
       }
     }
   }
   
-  # If no root key provided or no cells found, use velocity pseudotime
-  if (is.null(root_cells) || length(root_cells) == 0) {
-    # Use cells with lowest t_sum as roots
-    root_cells <- order(t_sum)[1:min(10, ceiling(length(t_sum) * 0.05))]
+  # Normalize to [0, 1]
+  t_shared <- (t_shared - min(t_shared, na.rm = TRUE)) / 
+              (max(t_shared, na.rm = TRUE) - min(t_shared, na.rm = TRUE) + 1e-10)
+  
+  # Smooth with connectivities
+  if (!is.null(connectivities)) {
+    conn_norm <- connectivities / Matrix::rowSums(connectivities)
+    t_shared <- as.vector(conn_norm %*% t_shared)
+    
+    # Re-normalize
+    t_shared <- (t_shared - min(t_shared, na.rm = TRUE)) / 
+                (max(t_shared, na.rm = TRUE) - min(t_shared, na.rm = TRUE) + 1e-10)
   }
   
-  if (verbose) {
-    message(sprintf("  Using %d root cells", length(root_cells)))
-  }
-  
-  # Compute latent time using multiple roots
-  n_roots <- min(length(root_cells), 4)
-  latent_time_list <- matrix(NA, n_roots, nrow(t))
-  
-  for (i in seq_len(n_roots)) {
-    root <- root_cells[i]
-    
-    # Root the time matrix
-    rooted <- root_time(t, root)
-    t_rooted <- rooted$t
-    
-    # Compute shared time
-    latent_time_list[i, ] <- compute_shared_time(t_rooted)
-  }
-  
-  # Average across roots
-  latent_time <- colMeans(latent_time_list, na.rm = TRUE)
-  
-  # Scale to [0, 1]
-  latent_time <- scale_to_range(latent_time)
-  
-  # Incorporate end cell information if provided
-  if (!is.null(end_key) && end_key %in% colnames(object@meta.data)) {
-    end_indicator <- object@meta.data[[end_key]]
-    
-    end_cells <- NULL
-    if (is.numeric(end_indicator)) {
-      end_cells <- which(end_indicator > quantile(end_indicator, 0.95, na.rm = TRUE))
-    } else if (is.logical(end_indicator)) {
-      end_cells <- which(end_indicator)
-    }
-    
-    if (!is.null(end_cells) && length(end_cells) > 0) {
-      # Compute time from end cells
-      n_ends <- min(length(end_cells), 4)
-      latent_time_end <- matrix(NA, n_ends, nrow(t))
-      
-      for (i in seq_len(n_ends)) {
-        end <- end_cells[i]
-        rooted <- root_time(t, end)
-        latent_time_end[i, ] <- 1 - compute_shared_time(rooted$t)
-      }
-      
-      latent_time_end_avg <- colMeans(latent_time_end, na.rm = TRUE)
-      latent_time_end_avg <- scale_to_range(latent_time_end_avg)
-      
-      # Combine with weight
-      latent_time <- scale_to_range(latent_time + 0.2 * latent_time_end_avg)
-    }
-  }
-  
-  # Smooth with connectivity and local coherence filtering
-  if (!is.null(conn)) {
-    tl <- latent_time
-    tc <- as.vector(conn %*% latent_time)
-    
-    # Local coherence confidence
-    z <- sum(tl * tc) / sum(tc * tc)
-    tl_conf <- (1 - abs(tl / max(tl, na.rm = TRUE) - tc * z / max(tl, na.rm = TRUE)))^2
-    
-    idx_low_confidence <- tl_conf < min_confidence
-    
-    # Smooth low confidence cells
-    conn_smooth <- conn
-    conn_smooth[, idx_low_confidence] <- 0
-    conn_smooth <- drop0(conn_smooth)
-    
-    latent_time <- as.vector(conn_smooth %*% latent_time)
-  }
-  
-  # Final scaling
-  latent_time <- scale_to_range(latent_time)
-  
-  # Apply t_max if specified
-  if (!is.null(t_max)) {
-    latent_time <- latent_time * t_max
-  }
-  
-  # Store in metadata
-  object@meta.data$latent_time <- latent_time
-  
-  if (verbose) {
-    message("Done. Latent time stored in object@meta.data$latent_time")
-  }
-  
-  object
-}
-
-#' Root Time Matrix
-#'
-#' @description Reroot time matrix based on a specified root cell.
-#'
-#' @param t Time matrix (cells x genes)
-#' @param root Index of root cell
-#'
-#' @return List with rooted time matrix and switch times
-#' @keywords internal
-root_time <- function(t, root = NULL) {
-  
-  # Handle NaN columns
-  valid_cols <- colSums(is.na(t)) < nrow(t)
-  t_valid <- t[, valid_cols, drop = FALSE]
-  
-  if (is.null(root)) {
-    t_root <- rep(0, ncol(t_valid))
-  } else {
-    t_root <- t_valid[root, ]
-  }
-  
-  n_cells <- nrow(t_valid)
-  n_genes <- ncol(t_valid)
-  
-  t_rooted <- matrix(NA, n_cells, n_genes)
-  t_switch <- numeric(n_genes)
-  
-  for (j in seq_len(n_genes)) {
-    t_col <- t_valid[, j]
-    t_r <- t_root[j]
-    
-    if (is.na(t_r)) {
-      t_rooted[, j] <- t_col
-      next
-    }
-    
-    # Cells after root (o = 1)
-    o <- as.integer(t_col >= t_r)
-    
-    # Time after root
-    t_after <- (t_col - t_r) * o
-    
-    # Origin time (max time from root)
-    t_origin <- max(t_after, na.rm = TRUE)
-    if (!is.finite(t_origin)) t_origin <- 0
-    
-    # Time before root (shifted to positive)
-    t_before <- (t_col + t_origin) * (1 - o)
-    
-    # Switch time
-    t_switch[j] <- min(t_before[t_before > 0], na.rm = TRUE)
-    if (!is.finite(t_switch[j])) t_switch[j] <- 0
-    
-    # Rooted time
-    t_rooted[, j] <- t_after + t_before
-  }
-  
-  list(t = t_rooted, t_switch = t_switch)
-}
-
-#' Compute Shared Time
-#'
-#' @description Compute gene-shared time by selecting optimal percentiles.
-#' The algorithm finds percentiles that produce the most linear distribution
-#' of cell times.
-#'
-#' @param t Rooted time matrix (cells x genes)
-#' @param percentiles Vector of percentiles to try
-#' @param normalize Whether to normalize to [0, 1]
-#'
-#' @return Vector of shared times
-#' @keywords internal
-compute_shared_time <- function(t, 
-                                 percentiles = c(15, 20, 25, 30, 35),
-                                 normalize = TRUE) {
-  
-  # Remove NaN columns
-  valid_cols <- colSums(is.na(t)) < nrow(t)
-  t <- t[, valid_cols, drop = FALSE]
-  
-  # Shift to start at 0
-  t <- t - min(t, na.rm = TRUE)
-  
-  n_cells <- nrow(t)
-  n_perc <- length(percentiles)
-  
-  # Compute percentile times for each gene
-  tx_list <- matrix(NA, n_perc, n_cells)
-  
-  for (i in seq_len(n_perc)) {
-    perc <- percentiles[i]
-    
-    # For each cell, get the percentile across genes
-    for (k in seq_len(n_cells)) {
-      tx_list[i, k] <- quantile(t[k, ], perc / 100, na.rm = TRUE)
-    }
-  }
-  
-  # Normalize each percentile series
-  tx_max <- apply(tx_list, 1, max, na.rm = TRUE)
-  tx_max[tx_max == 0] <- 1
-  tx_list <- tx_list / tx_max
-  
-  # Find percentiles with most linear distribution
-  mse <- numeric(n_perc)
-  
-  for (i in seq_len(n_perc)) {
-    tx <- tx_list[i, ]
-    tx_sorted <- sort(tx, na.last = TRUE)
-    linx <- seq(0, 1, length.out = length(tx_sorted))
-    mse[i] <- sum((tx_sorted - linx)^2, na.rm = TRUE)
-  }
-  
-  # Use best 2 percentiles
-  best_idx <- order(mse)[1:min(2, n_perc)]
-  
-  # Average the best percentiles
-  t_shared <- colMeans(tx_list[best_idx, , drop = FALSE], na.rm = TRUE)
-  
-  if (normalize) {
-    t_shared <- t_shared / max(t_shared, na.rm = TRUE)
+  # Add to Seurat
+  if (inherits(seurat, "Seurat")) {
+    seurat$latent_time <- t_shared
+    seurat@misc$velocity$latent_time <- t_shared
+    return(seurat)
   }
   
   t_shared
 }
 
-#' Scale to Range
-#'
-#' @description Scale vector to [0, 1] range.
-#'
-#' @param x Numeric vector
-#'
-#' @return Scaled vector
-#' @keywords internal
-scale_to_range <- function(x) {
-  x_min <- min(x, na.rm = TRUE)
-  x_max <- max(x, na.rm = TRUE)
-  
-  if (x_max == x_min) {
-    return(rep(0.5, length(x)))
-  }
-  
-  (x - x_min) / (x_max - x_min)
-}
-
-#' Terminal States Detection
-#'
-#' @description Identify terminal states (root and end cells) using velocity graph.
-#'
-#' @param object Seurat object with velocity graph computed
-#' @param n_states Number of terminal states to detect (default 2)
-#' @param min_cells Minimum cells for a terminal state
-#' @param verbose Print progress
-#'
-#' @return Seurat object with terminal state annotations
-#' @export
-terminal_states <- function(object,
-                            n_states = 2,
-                            min_cells = 10,
-                            verbose = TRUE) {
-  
-  # Get transition matrix
-  T <- NULL
-  
-  if (!is.null(object@misc$scVeloR$velocity$transition_matrix)) {
-    T <- object@misc$scVeloR$velocity$transition_matrix
-  } else if (!is.null(object@misc$scVeloR$velocity_graph$transition_matrix)) {
-    T <- object@misc$scVeloR$velocity_graph$transition_matrix
-  }
-  
-  if (is.null(T)) {
-    stop("Compute velocity graph first using velocity_graph()")
-  }
-  
-  if (verbose) {
-    message("Detecting terminal states...")
-  }
-  
-  n_cells <- nrow(T)
-  
-  # Compute stationary distribution for roots (reverse transitions)
-  T_rev <- t(T)
-  T_rev <- T_rev / rowSums(T_rev)
-  T_rev[!is.finite(T_rev)] <- 0
-  
-  # Power iteration for stationary distribution
-  root_probs <- rep(1 / n_cells, n_cells)
-  for (i in 1:100) {
-    root_probs_new <- as.vector(T_rev %*% root_probs)
-    root_probs_new <- root_probs_new / sum(root_probs_new)
-    
-    if (max(abs(root_probs_new - root_probs)) < 1e-6) break
-    root_probs <- root_probs_new
-  }
-  
-  # Compute end probabilities (forward transitions)
-  T_fwd <- T / rowSums(T)
-  T_fwd[!is.finite(T_fwd)] <- 0
-  
-  end_probs <- rep(1 / n_cells, n_cells)
-  for (i in 1:100) {
-    end_probs_new <- as.vector(T_fwd %*% end_probs)
-    end_probs_new <- end_probs_new / sum(end_probs_new)
-    
-    if (max(abs(end_probs_new - end_probs)) < 1e-6) break
-    end_probs <- end_probs_new
-  }
-  
-  # Store in metadata
-  object@meta.data$root_cells <- root_probs
-  object@meta.data$end_cells <- end_probs
-  
-  # Identify discrete terminal states
-  root_threshold <- quantile(root_probs, 1 - min_cells / n_cells)
-  end_threshold <- quantile(end_probs, 1 - min_cells / n_cells)
-  
-  object@meta.data$is_root <- root_probs >= root_threshold
-  object@meta.data$is_end <- end_probs >= end_threshold
-  
-  if (verbose) {
-    n_roots <- sum(object@meta.data$is_root)
-    n_ends <- sum(object@meta.data$is_end)
-    message(sprintf("  Identified %d root cells and %d end cells", n_roots, n_ends))
-  }
-  
-  object
-}
-
 #' Velocity Pseudotime
 #'
-#' @description Compute pseudotime based on velocity-directed diffusion.
-#'
-#' @param object Seurat object
-#' @param root Root cell index or NULL for automatic detection
+#' @description Computes a velocity-based pseudotime using transition probabilities
+#' @param seurat Seurat object with velocity
+#' @param vkey Velocity key
+#' @param groupby Group by variable
+#' @param groups Groups to include
+#' @param root_key Root cell key
+#' @param end_key End cell key
+#' @param use_velocity Use velocity graph
 #' @param n_dcs Number of diffusion components
-#' @param verbose Print progress
-#'
-#' @return Seurat object with velocity_pseudotime in metadata
+#' @param use_raw Use raw velocity
+#' @param self_transitions Allow self transitions
+#' @param eps Epsilon for numerical stability
+#' @param copy Return copy
+#' @return Modified Seurat object or pseudotime vector
 #' @export
-velocity_pseudotime <- function(object,
-                                 root = NULL,
-                                 n_dcs = 10,
-                                 verbose = TRUE) {
+velocity_pseudotime <- function(seurat,
+                                vkey = "velocity",
+                                groupby = NULL,
+                                groups = NULL,
+                                root_key = NULL,
+                                end_key = NULL,
+                                use_velocity = TRUE,
+                                n_dcs = 10,
+                                use_raw = FALSE,
+                                self_transitions = FALSE,
+                                eps = 1e-3,
+                                copy = FALSE) {
+  
+  # Get velocity data
+  if (!"velocity" %in% names(seurat@misc)) {
+    stop("Run velocity() first")
+  }
+  
+  vdata <- seurat@misc$velocity
   
   # Get transition matrix
-  T <- NULL
-  
-  if (!is.null(object@misc$scVeloR$velocity$transition_matrix)) {
-    T <- object@misc$scVeloR$velocity$transition_matrix
-  } else if (!is.null(object@misc$scVeloR$velocity_graph$transition_matrix)) {
-    T <- object@misc$scVeloR$velocity_graph$transition_matrix
+  if ("transition_matrix" %in% names(vdata)) {
+    T_mat <- vdata$transition_matrix
+  } else if ("velocity_graph" %in% names(vdata)) {
+    T_mat <- compute_transition_matrix(vdata$velocity_graph)
+  } else {
+    stop("Need velocity graph or transition matrix")
   }
   
-  if (is.null(T)) {
-    stop("Compute velocity graph first using velocity_graph()")
+  n_cells <- nrow(T_mat)
+  
+  # Remove self transitions if requested
+  if (!self_transitions) {
+    diag(T_mat) <- 0
+    T_mat <- T_mat / (rowSums(T_mat) + eps)
   }
   
-  if (verbose) {
-    message("Computing velocity pseudotime...")
+  # Determine root cells
+  if (!is.null(root_key) && root_key %in% colnames(seurat@meta.data)) {
+    roots <- which(seurat@meta.data[[root_key]])
+  } else {
+    # Use cells with highest incoming transitions (sources)
+    incoming <- colSums(T_mat)
+    outgoing <- rowSums(T_mat)
+    source_score <- outgoing - incoming
+    roots <- order(source_score, decreasing = TRUE)[1:max(1, n_cells %/% 100)]
   }
   
-  n_cells <- nrow(T)
+  # Determine end cells
+  if (!is.null(end_key) && end_key %in% colnames(seurat@meta.data)) {
+    ends <- which(seurat@meta.data[[end_key]])
+  } else {
+    incoming <- colSums(T_mat)
+    outgoing <- rowSums(T_mat)
+    sink_score <- incoming - outgoing
+    ends <- order(sink_score, decreasing = TRUE)[1:max(1, n_cells %/% 100)]
+  }
   
-  # Determine root if not provided
-  if (is.null(root)) {
-    if ("root_cells" %in% colnames(object@meta.data)) {
-      root <- which.max(object@meta.data$root_cells)
-    } else {
-      # Use cell with most outgoing transitions
-      out_degree <- rowSums(T > 0)
-      root <- which.max(out_degree)
+  # Compute pseudotime using absorption probabilities
+  pseudotime <- compute_absorption_time(T_mat, ends)
+  
+  # Invert so root has low time
+  root_time <- mean(pseudotime[roots], na.rm = TRUE)
+  end_time <- mean(pseudotime[ends], na.rm = TRUE)
+  
+  if (root_time > end_time) {
+    pseudotime <- max(pseudotime, na.rm = TRUE) - pseudotime
+  }
+  
+  # Normalize
+  pseudotime <- (pseudotime - min(pseudotime, na.rm = TRUE)) /
+                (max(pseudotime, na.rm = TRUE) - min(pseudotime, na.rm = TRUE) + 1e-10)
+  
+  # Add to Seurat
+  seurat$velocity_pseudotime <- pseudotime
+  seurat@misc$velocity$pseudotime <- pseudotime
+  
+  seurat
+}
+
+#' Compute absorption time
+#'
+#' @description Compute mean hitting time to absorbing states
+#' @param T_mat Transition matrix
+#' @param absorbing Indices of absorbing states
+#' @param max_iter Maximum iterations for power method
+#' @return Mean hitting time vector
+#' @keywords internal
+compute_absorption_time <- function(T_mat, absorbing, max_iter = 1000) {
+  n <- nrow(T_mat)
+  
+  # Simple approach: iteratively propagate time
+  time <- rep(0, n)
+  time[absorbing] <- 0
+  
+  # Non-absorbing states
+  transient <- setdiff(seq_len(n), absorbing)
+  
+  if (length(transient) == 0) {
+    return(time)
+  }
+  
+  # Power iteration
+  for (i in seq_len(max_iter)) {
+    time_new <- time
+    time_new[transient] <- 1 + as.vector(T_mat[transient, , drop = FALSE] %*% time)
+    
+    # Convergence check
+    if (max(abs(time_new - time)) < 1e-6) break
+    time <- time_new
+  }
+  
+  time
+}
+
+#' Terminal States
+#'
+#' @description Identify terminal (end) states using velocity
+#' @param seurat Seurat object with velocity
+#' @param vkey Velocity key
+#' @param groupby Group by variable
+#' @param groups Groups to include
+#' @param self_transitions Include self transitions
+#' @param eps Epsilon
+#' @param random_state Random seed
+#' @param copy Return copy
+#' @return Modified Seurat object with terminal_states column
+#' @export
+terminal_states <- function(seurat,
+                            vkey = "velocity",
+                            groupby = NULL,
+                            groups = NULL,
+                            self_transitions = FALSE,
+                            eps = 1e-3,
+                            random_state = 0,
+                            copy = FALSE) {
+  
+  set.seed(random_state)
+  
+  # Get velocity data
+  if (!"velocity" %in% names(seurat@misc)) {
+    stop("Run velocity() first")
+  }
+  
+  vdata <- seurat@misc$velocity
+  
+  # Get or compute transition matrix
+  if ("transition_matrix" %in% names(vdata)) {
+    T_mat <- vdata$transition_matrix
+  } else if ("velocity_graph" %in% names(vdata)) {
+    T_mat <- compute_transition_matrix(vdata$velocity_graph)
+  } else {
+    stop("Need velocity graph first")
+  }
+  
+  n_cells <- nrow(T_mat)
+  
+  # Remove self transitions
+  if (!self_transitions) {
+    diag(T_mat) <- 0
+    T_mat <- T_mat / (rowSums(T_mat) + eps)
+  }
+  
+  # Compute terminal state scores based on:
+  # 1. Low outgoing transitions (sink)
+  # 2. High incoming transitions  
+  outgoing <- rowSums(T_mat)
+  incoming <- colSums(T_mat)
+  
+  # Terminal score: high incoming / outgoing ratio
+  terminal_score <- incoming / (outgoing + eps)
+  
+  # Normalize
+  terminal_score <- (terminal_score - min(terminal_score, na.rm = TRUE)) /
+                    (max(terminal_score, na.rm = TRUE) - min(terminal_score, na.rm = TRUE) + 1e-10)
+  
+  # Root score: high outgoing / incoming ratio
+  root_score <- outgoing / (incoming + eps)
+  root_score <- (root_score - min(root_score, na.rm = TRUE)) /
+                (max(root_score, na.rm = TRUE) - min(root_score, na.rm = TRUE) + 1e-10)
+  
+  # Add to Seurat
+  seurat$terminal_score <- terminal_score
+  seurat$root_score <- root_score
+  
+  # Binary classification
+  seurat$is_terminal <- terminal_score > quantile(terminal_score, 0.95)
+  seurat$is_root <- root_score > quantile(root_score, 0.95)
+  
+  seurat@misc$velocity$terminal_score <- terminal_score
+  seurat@misc$velocity$root_score <- root_score
+  
+  seurat
+}
+
+#' Rank Velocity Genes
+#'
+#' @description Rank genes by their velocity fit quality
+#' @param seurat Seurat object with velocity
+#' @param n_genes Number of top genes to return
+#' @param min_r2 Minimum R2 threshold
+#' @param min_counts Minimum counts
+#' @param ... Additional arguments
+#' @return Data frame with ranked genes
+#' @export
+rank_velocity_genes <- function(seurat, n_genes = 100, min_r2 = 0.1, min_counts = 10, ...) {
+  
+  if (!"velocity" %in% names(seurat@misc)) {
+    stop("Run velocity() first")
+  }
+  
+  vdata <- seurat@misc$velocity
+  
+  if ("gene_params" %in% names(vdata)) {
+    # From dynamical model
+    params <- vdata$gene_params
+    
+    # Compute scores
+    params$score <- params$likelihood * (1 - params$pval_steady)
+    params$score[is.na(params$score)] <- 0
+    
+    # Filter and rank
+    valid <- !is.na(params$alpha) & params$likelihood > min_r2
+    params <- params[valid, ]
+    params <- params[order(params$score, decreasing = TRUE), ]
+    
+    if (nrow(params) > n_genes) {
+      params <- params[1:n_genes, ]
     }
+    
+    return(params)
+  } else if ("r2" %in% names(vdata)) {
+    # From steady-state model
+    r2 <- vdata$r2
+    gamma <- vdata$gamma
+    gene_names <- names(r2)
+    
+    if (is.null(gene_names)) {
+      gene_names <- paste0("gene_", seq_along(r2))
+    }
+    
+    # Create result
+    result <- data.frame(
+      gene = gene_names,
+      r2 = r2,
+      gamma = gamma,
+      stringsAsFactors = FALSE
+    )
+    
+    # Filter and rank
+    result <- result[result$r2 >= min_r2, ]
+    result <- result[order(result$r2, decreasing = TRUE), ]
+    
+    if (nrow(result) > n_genes) {
+      result <- result[1:n_genes, ]
+    }
+    
+    return(result)
+  } else {
+    stop("No gene ranking information available")
+  }
+}
+
+#' Compute velocity confidence
+#'
+#' @description Compute confidence scores for velocity estimates
+#' @param seurat Seurat object with velocity
+#' @param vkey Velocity key
+#' @param copy Return copy
+#' @return Modified Seurat object with confidence scores
+#' @export
+velocity_confidence <- function(seurat, vkey = "velocity", copy = FALSE) {
+  
+  if (!"velocity" %in% names(seurat@misc)) {
+    stop("Run velocity() first")
   }
   
-  if (verbose) {
-    message(sprintf("  Using cell %d as root", root))
+  vdata <- seurat@misc$velocity
+  
+  if (!"velocity_graph" %in% names(vdata)) {
+    stop("Need velocity graph for confidence computation")
   }
   
-  # Compute diffusion distance from root
-  # Symmetric normalized transition matrix
-  T_sym <- (T + t(T)) / 2
-  D <- rowSums(T_sym)
-  D_inv_sqrt <- 1 / sqrt(D)
-  D_inv_sqrt[!is.finite(D_inv_sqrt)] <- 0
+  vgraph <- vdata$velocity_graph
   
-  T_norm <- Diagonal(x = D_inv_sqrt) %*% T_sym %*% Diagonal(x = D_inv_sqrt)
+  # Confidence = mean transition weight
+  confidence <- Matrix::rowMeans(vgraph)
   
-  # Compute eigendecomposition
-  n_components <- min(n_dcs + 1, n_cells - 1)
-  
-  eig <- tryCatch({
-    RSpectra::eigs_sym(T_norm, k = n_components, which = "LM")
-  }, error = function(e) {
-    eigen(as.matrix(T_norm), symmetric = TRUE)
-  })
-  
-  # Get diffusion components
-  dcs <- eig$vectors[, 2:min(n_components, ncol(eig$vectors)), drop = FALSE]
-  
-  # Scale by eigenvalues
-  eigenvalues <- eig$values[2:min(n_components, length(eig$values))]
-  dcs <- dcs %*% diag(eigenvalues)
-  
-  # Compute pseudotime as distance from root in diffusion space
-  root_dc <- dcs[root, ]
-  
-  pseudotime <- numeric(n_cells)
-  for (i in seq_len(n_cells)) {
-    pseudotime[i] <- sqrt(sum((dcs[i, ] - root_dc)^2))
+  # Coherence = how consistent are velocity directions among neighbors
+  # Get cell embeddings
+  if (!is.null(vdata$velocity_embedding)) {
+    V <- vdata$velocity_embedding
+    
+    # Normalize velocities
+    V_norm <- V / (sqrt(rowSums(V^2)) + 1e-10)
+    
+    # Get neighbors from velocity graph
+    neighbors <- which(vgraph > 0, arr.ind = TRUE)
+    
+    if (nrow(neighbors) > 0) {
+      # Compute local coherence
+      coherence <- rep(0, nrow(V))
+      
+      for (i in seq_len(nrow(V))) {
+        nn_idx <- which(vgraph[i, ] > 0)
+        if (length(nn_idx) > 0) {
+          # Cosine similarity with neighbors
+          cos_sim <- V_norm[i, , drop = FALSE] %*% t(V_norm[nn_idx, , drop = FALSE])
+          coherence[i] <- mean(cos_sim, na.rm = TRUE)
+        }
+      }
+    } else {
+      coherence <- rep(NA, nrow(V))
+    }
+  } else {
+    coherence <- rep(NA, nrow(vgraph))
   }
   
-  # Scale to [0, 1]
-  pseudotime <- scale_to_range(pseudotime)
+  # Add to Seurat
+  seurat$velocity_confidence <- confidence
+  seurat$velocity_coherence <- coherence
   
-  # Store in metadata
-  object@meta.data$velocity_pseudotime <- pseudotime
+  seurat@misc$velocity$confidence <- confidence
+  seurat@misc$velocity$coherence <- coherence
   
-  if (verbose) {
-    message("Done. Velocity pseudotime stored in object@meta.data$velocity_pseudotime")
+  seurat
+}
+
+#' Velocity-based cell cycle scoring
+#' 
+#' @description Score cell cycle phase using velocity information
+#' @param seurat Seurat object
+#' @param s_genes S phase genes
+#' @param g2m_genes G2/M phase genes
+#' @param vkey Velocity key
+#' @return Modified Seurat object with cycle scores
+#' @export
+velocity_cell_cycle <- function(seurat, s_genes, g2m_genes, vkey = "velocity") {
+  
+  if (!"velocity" %in% names(seurat@misc)) {
+    stop("Run velocity() first")
   }
   
-  object
+  vdata <- seurat@misc$velocity
+  velocity_s <- vdata$velocity_s
+  
+  gene_names <- colnames(velocity_s)
+  
+  # Find gene indices
+  s_idx <- which(gene_names %in% s_genes)
+  g2m_idx <- which(gene_names %in% g2m_genes)
+  
+  if (length(s_idx) == 0 && length(g2m_idx) == 0) {
+    warning("No cell cycle genes found in velocity data")
+    return(seurat)
+  }
+  
+  # Compute velocity-based scores
+  s_score <- if (length(s_idx) > 0) {
+    rowMeans(velocity_s[, s_idx, drop = FALSE], na.rm = TRUE)
+  } else {
+    rep(0, nrow(velocity_s))
+  }
+  
+  g2m_score <- if (length(g2m_idx) > 0) {
+    rowMeans(velocity_s[, g2m_idx, drop = FALSE], na.rm = TRUE)
+  } else {
+    rep(0, nrow(velocity_s))
+  }
+  
+  # Normalize
+  s_score <- scale(s_score)[, 1]
+  g2m_score <- scale(g2m_score)[, 1]
+  
+  # Add to Seurat
+  seurat$velocity_S_score <- s_score
+  seurat$velocity_G2M_score <- g2m_score
+  
+  seurat
 }
