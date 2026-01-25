@@ -522,3 +522,38 @@ normalize <- function(X, axis = 0, min_confidence = NULL) {
     sweep(X, 1, X_sum, "/")
   }
 }
+
+#' Get Steady State Values
+#'
+#' @description Calculate steady state mRNA levels.
+#'
+#' @param alpha Transcription rate
+#' @param beta Splicing rate
+#' @param gamma Degradation rate
+#'
+#' @return List with u_inf and s_inf
+#' @export
+steady_state <- function(alpha, beta, gamma) {
+  list(
+    u_inf = alpha / beta,
+    s_inf = alpha / gamma
+  )
+}
+
+#' Compute Velocity from Parameters
+#'
+#' @description Compute RNA velocity: du/dt = alpha - beta*u, ds/dt = beta*u - gamma*s
+#'
+#' @param u Unspliced abundance
+#' @param s Spliced abundance
+#' @param alpha Transcription rate (0 in repression phase)
+#' @param beta Splicing rate
+#' @param gamma Degradation rate
+#'
+#' @return List with velocity_u and velocity_s
+#' @export
+compute_velocity_from_params <- function(u, s, alpha, beta, gamma) {
+  velocity_u <- alpha - beta * u
+  velocity_s <- beta * u - gamma * s
+  list(velocity_u = velocity_u, velocity_s = velocity_s)
+}

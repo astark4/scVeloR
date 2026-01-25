@@ -170,44 +170,6 @@ velocity_steady_state <- function(object,
   object
 }
 
-#' Rank Velocity Genes
-#'
-#' @description Rank genes by velocity fit quality (R-squared).
-#'
-#' @param object Seurat object with velocity computed
-#' @param n_top Number of top genes to return
-#' @param groupby Optional grouping variable
-#'
-#' @return Data frame with ranked genes
-#' @export
-rank_velocity_genes <- function(object,
-                                n_top = 100,
-                                groupby = NULL) {
-  
-  if (is.null(object@misc$scVeloR$velocity)) {
-    stop("Run velocity() first")
-  }
-  
-  r2 <- object@misc$scVeloR$velocity$r2
-  
-  # Remove NA values
-  valid <- !is.na(r2)
-  r2_valid <- r2[valid]
-  gene_names <- names(r2)[valid]
-  
-  # Sort by R2
-  order_idx <- order(r2_valid, decreasing = TRUE)
-  
-  n_return <- min(n_top, length(order_idx))
-  
-  data.frame(
-    gene = gene_names[order_idx[1:n_return]],
-    r2 = r2_valid[order_idx[1:n_return]],
-    rank = 1:n_return,
-    stringsAsFactors = FALSE
-  )
-}
-
 #' Test Velocity Gene Bimodality
 #'
 #' @description Test whether a gene shows bimodal expression distribution,

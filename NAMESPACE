@@ -18,7 +18,7 @@ export(BaseDynamics)
 export(DynamicsRecovery)
 export(SecondOrderSteadyStateModel)
 
-# Dynamics module - ODE solutions
+# Dynamics module - ODE solutions (from splicing_dynamics.R)
 export(unspliced)
 export(spliced)
 export(mRNA)

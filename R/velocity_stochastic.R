@@ -334,8 +334,8 @@ SecondOrderSteadyStateModel <- R6::R6Class(
 #' @param X Expression matrix (cells x genes)
 #' @param connectivities Connectivity matrix (cells x cells)
 #' @return Matrix of second-order moments
-#' @export
-second_order_moments <- function(X, connectivities) {
+#' @keywords internal
+compute_second_order_moments_matrix <- function(X, connectivities) {
   # Normalize connectivities
   conn_norm <- connectivities / Matrix::rowSums(connectivities)
   conn_norm[!is.finite(conn_norm)] <- 0
