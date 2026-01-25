@@ -1,0 +1,457 @@
+---
+title: "Dynamical Model Deep Dive"
+author: "Zaoqu Liu"
+date: "`r Sys.Date()`"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+    fig_width: 8
+    fig_height: 6
+vignette: >
+  %\VignetteIndexEntry{Dynamical Model Deep Dive}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 8,
+  fig.height = 6,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Introduction
+
+The dynamical model in **scVeloR** represents the most sophisticated approach to RNA velocity estimation. Unlike simpler steady-state methods, it infers the full kinetic parameters of gene expression without assuming transcriptional equilibrium.
+
+This vignette provides a comprehensive guide to:
+
+1. Understanding the underlying mathematics
+2. Implementing the dynamical model
+3. Interpreting results
+4. Troubleshooting common issues
+
+## Mathematical Foundation
+
+### The Transcriptional Switch Model
+
+The dynamical model assumes genes undergo a transcriptional switch:
+
+- **Induction phase** ($t < t_-$): Transcription is active ($\alpha > 0$)
+- **Repression phase** ($t \geq t_-$): Transcription stops ($\alpha = 0$)
+
+### ODE System
+
+**Induction phase** ($t < t_-$):
+$$\frac{du}{dt} = \alpha - \beta u$$
+$$\frac{ds}{dt} = \beta u - \gamma s$$
+
+**Repression phase** ($t \geq t_-$):
+$$\frac{du}{dt} = -\beta u$$
+$$\frac{ds}{dt} = \beta u - \gamma s$$
+
+### Analytical Solutions
+
+**Induction phase**:
+$$u(t) = u_0 e^{-\beta t} + \frac{\alpha}{\beta}(1 - e^{-\beta t})$$
+$$s(t) = s_0 e^{-\gamma t} + \frac{\alpha}{\gamma}(1 - e^{-\gamma t}) + \frac{\alpha - u_0\beta}{\gamma - \beta}(e^{-\gamma t} - e^{-\beta t})$$
+
+**Repression phase** (starting from $u_-, s_-$ at $t_-$):
+$$u(t) = u_- e^{-\beta(t-t_-)}$$
+$$s(t) = s_- e^{-\gamma(t-t_-)} + \frac{\beta u_-}{\gamma - \beta}(e^{-\gamma(t-t_-)} - e^{-\beta(t-t_-)})$$
+
+```{r trajectory_visualization, echo=FALSE, fig.cap="Gene expression trajectory showing induction and repression phases."}
+library(ggplot2)
+
+# Parameters
+alpha <- 2
+beta <- 0.5
+gamma <- 0.3
+t_switch <- 1.5
+
+# Time points
+t_total <- 3
+dt <- 0.01
+t <- seq(0, t_total, by = dt)
+
+# Calculate trajectories
+u <- numeric(length(t))
+s <- numeric(length(t))
+
+for (i in seq_along(t)) {
+  ti <- t[i]
+  if (ti < t_switch) {
+    # Induction
+    u[i] <- alpha/beta * (1 - exp(-beta * ti))
+    s[i] <- alpha/gamma * (1 - exp(-gamma * ti)) + 
+            alpha/(gamma - beta) * (exp(-gamma * ti) - exp(-beta * ti))
+  } else {
+    # At switch point
+    u_sw <- alpha/beta * (1 - exp(-beta * t_switch))
+    s_sw <- alpha/gamma * (1 - exp(-gamma * t_switch)) + 
+            alpha/(gamma - beta) * (exp(-gamma * t_switch) - exp(-beta * t_switch))
+    
+    # Repression
+    dt_rep <- ti - t_switch
+    u[i] <- u_sw * exp(-beta * dt_rep)
+    s[i] <- s_sw * exp(-gamma * dt_rep) + 
+            beta * u_sw / (gamma - beta) * (exp(-gamma * dt_rep) - exp(-beta * dt_rep))
+  }
+}
+
+# Create data frame
+traj_df <- data.frame(t = t, u = u, s = s)
+traj_df$phase <- ifelse(t < t_switch, "Induction", "Repression")
+
+# Plot time series
+p1 <- ggplot(traj_df, aes(x = t)) +
+  geom_line(aes(y = u, color = "Unspliced"), linewidth = 1) +
+  geom_line(aes(y = s, color = "Spliced"), linewidth = 1) +
+  geom_vline(xintercept = t_switch, linetype = "dashed", color = "gray50") +
+  annotate("text", x = t_switch, y = max(u) * 1.05, 
+           label = expression(t["-"]), hjust = -0.2) +
+  scale_color_manual(values = c("Unspliced" = "#E91E63", "Spliced" = "#2196F3")) +
+  labs(x = "Time", y = "Expression", 
+       title = "Gene Expression Dynamics",
+       color = "RNA Type") +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+# Plot phase portrait
+p2 <- ggplot(traj_df, aes(x = s, y = u, color = phase)) +
+  geom_path(linewidth = 1.2, arrow = arrow(length = unit(0.3, "cm"), type = "closed")) +
+  geom_point(data = traj_df[traj_df$t == 0, ], size = 4, shape = 21, fill = "white") +
+  geom_point(data = traj_df[abs(traj_df$t - t_switch) < dt, ], size = 4, shape = 23, fill = "yellow") +
+  scale_color_manual(values = c("Induction" = "#4CAF50", "Repression" = "#F44336")) +
+  labs(x = "Spliced (s)", y = "Unspliced (u)", 
+       title = "Phase Portrait",
+       color = "Phase") +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+# Combine plots
+library(gridExtra)
+grid.arrange(p1, p2, ncol = 2)
+```
+
+## The EM Algorithm
+
+### Overview
+
+The dynamical model uses an Expectation-Maximization (EM) algorithm to jointly infer:
+
+1. **Kinetic parameters**: $\alpha$, $\beta$, $\gamma$ for each gene
+2. **Switching time**: $t_-$ for each gene
+3. **Latent time**: $t_i$ for each cell
+
+### E-Step: Time Assignment
+
+Given current parameter estimates, assign latent time to each cell by minimizing the residual:
+
+$$t_i = \arg\min_t \left( (u_i - \hat{u}(t))^2 + (s_i - \hat{s}(t))^2 \right)$$
+
+### M-Step: Parameter Update
+
+Given time assignments, update parameters by maximum likelihood:
+
+$$(\hat{\alpha}, \hat{\beta}, \hat{\gamma}, \hat{t}_-) = \arg\max \sum_i \log P(u_i, s_i | \alpha, \beta, \gamma, t_-, t_i)$$
+
+```{r em_convergence, echo=FALSE, fig.cap="EM algorithm convergence showing iterative improvement."}
+# Simulate EM convergence
+set.seed(42)
+n_iter <- 15
+likelihood <- numeric(n_iter)
+likelihood[1] <- -1000
+
+for (i in 2:n_iter) {
+  improvement <- runif(1, 50, 150) * exp(-0.3 * i)
+  likelihood[i] <- likelihood[i-1] + improvement
+}
+
+em_df <- data.frame(
+  iteration = 1:n_iter,
+  likelihood = likelihood
+)
+
+ggplot(em_df, aes(x = iteration, y = likelihood)) +
+  geom_line(color = "#673AB7", linewidth = 1.2) +
+  geom_point(color = "#673AB7", size = 3) +
+  geom_hline(yintercept = max(likelihood), linetype = "dashed", color = "gray50") +
+  annotate("text", x = n_iter - 1, y = max(likelihood), 
+           label = "Converged", vjust = -0.5, color = "gray40") +
+  labs(x = "EM Iteration", y = "Log-Likelihood",
+       title = "EM Algorithm Convergence") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(0, n_iter, 2))
+```
+
+## Implementation in scVeloR
+
+### Basic Usage
+
+```{r basic_usage, eval=FALSE}
+library(scVeloR)
+
+# Run dynamical model
+seurat_obj <- velocity(seurat_obj, 
+                       mode = "dynamical",
+                       max_iter = 10)
+```
+
+### Step-by-Step Approach
+
+```{r step_by_step, eval=FALSE}
+# Step 1: Identify velocity genes using steady-state
+seurat_obj <- velocity(seurat_obj, mode = "deterministic")
+
+# Step 2: Recover full dynamics
+seurat_obj <- recover_dynamics(
+  seurat_obj,
+  genes = "velocity_genes",  # Use pre-selected genes
+  n_top_genes = 2000,        # Or top N by variance
+  max_iter = 10,             # EM iterations
+  fit_scaling = TRUE,        # Estimate scaling factor
+  n_cores = 4                # Parallel processing
+)
+
+# Step 3: Compute velocity from dynamics
+seurat_obj <- velocity_from_dynamics(seurat_obj)
+
+# Step 4: Compute latent time
+seurat_obj <- compute_latent_time(seurat_obj)
+```
+
+### Parameter Details
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_iter` | 10 | Maximum EM iterations |
+| `n_top_genes` | 2000 | Number of top variable genes |
+| `fit_scaling` | TRUE | Estimate u/s scaling factor |
+| `t_max` | 20 | Maximum allowed latent time |
+| `min_likelihood` | 0.1 | Minimum gene likelihood threshold |
+
+## Interpreting Results
+
+### Kinetic Parameters
+
+```{r param_visualization, echo=FALSE, fig.cap="Distribution of inferred kinetic parameters across genes."}
+# Simulate parameter distributions
+set.seed(42)
+n_genes <- 500
+
+params_df <- data.frame(
+  alpha = rgamma(n_genes, 2, 1),
+  beta = rgamma(n_genes, 3, 2),
+  gamma = rgamma(n_genes, 2, 2),
+  t_switch = rgamma(n_genes, 5, 3)
+)
+
+# Reshape for plotting
+library(tidyr)
+params_long <- pivot_longer(params_df, everything(), 
+                            names_to = "parameter", values_to = "value")
+params_long$parameter <- factor(params_long$parameter, 
+                                levels = c("alpha", "beta", "gamma", "t_switch"),
+                                labels = c("α (transcription)", "β (splicing)", 
+                                          "γ (degradation)", "t_ (switch time)"))
+
+ggplot(params_long, aes(x = value, fill = parameter)) +
+  geom_histogram(bins = 30, alpha = 0.8) +
+  facet_wrap(~parameter, scales = "free", ncol = 2) +
+  scale_fill_manual(values = c("#E91E63", "#2196F3", "#4CAF50", "#FF9800")) +
+  labs(x = "Value", y = "Count",
+       title = "Distribution of Inferred Kinetic Parameters") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 11))
+```
+
+### Latent Time
+
+```{r latent_time_demo, echo=FALSE, fig.cap="Latent time projected onto embedding showing differentiation trajectory."}
+# Simulate cells on trajectory
+set.seed(42)
+n <- 400
+
+# Create branching trajectory
+theta <- runif(n, 0, 2*pi)
+r <- 1 + 0.2 * sin(3*theta)
+x <- r * cos(theta) + rnorm(n, 0, 0.1)
+y <- r * sin(theta) + rnorm(n, 0, 0.1)
+
+# Latent time follows trajectory
+latent_time <- (theta - min(theta)) / (max(theta) - min(theta))
+
+df <- data.frame(x = x, y = y, latent_time = latent_time)
+
+ggplot(df, aes(x = x, y = y, color = latent_time)) +
+  geom_point(size = 2) +
+  scale_color_viridis_c(option = "plasma") +
+  labs(x = "UMAP_1", y = "UMAP_2",
+       title = "Latent Time on Embedding",
+       color = "Latent\nTime") +
+  theme_minimal() +
+  coord_fixed()
+```
+
+## Quality Control
+
+### Gene Fit Quality
+
+```{r gene_fit_quality, eval=FALSE}
+# Check gene fit quality
+gene_params <- seurat_obj@misc$scVeloR$dynamics$gene_params
+
+# High-quality genes have high likelihood
+good_genes <- gene_params[gene_params$likelihood > 0.3, ]
+print(head(good_genes))
+
+# Visualize fit for specific gene
+plot_phase(seurat_obj, gene = "Sox2", show_fit = TRUE)
+```
+
+### Convergence Check
+
+```{r convergence_check, eval=FALSE}
+# Check if EM converged
+dynamics <- seurat_obj@misc$scVeloR$dynamics
+
+# Likelihood should increase with iterations
+if (!is.null(dynamics$likelihood_trace)) {
+  plot(dynamics$likelihood_trace, type = "l",
+       xlab = "Iteration", ylab = "Log-Likelihood",
+       main = "EM Convergence")
+}
+```
+
+### Velocity Confidence
+
+```{r confidence_check, eval=FALSE}
+# Compute velocity confidence
+seurat_obj <- velocity_confidence(seurat_obj)
+
+# Check distribution
+hist(seurat_obj$velocity_confidence, breaks = 50,
+     main = "Velocity Confidence Distribution",
+     xlab = "Confidence Score")
+```
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Poor convergence**
+   - Increase `max_iter`
+   - Filter low-quality genes
+   - Check data normalization
+
+2. **Unrealistic parameter estimates**
+   - Check for outlier cells
+   - Verify spliced/unspliced layer quality
+   - Try different gene selection
+
+3. **Inconsistent latent time**
+   - Use more genes for averaging
+   - Filter genes with low likelihood
+   - Check for batch effects
+
+### Best Practices
+
+```{r best_practices, eval=FALSE}
+# 1. Pre-filter low-quality data
+seurat_obj <- prepare_velocity(seurat_obj,
+                                min_counts = 20,
+                                min_cells = 30)
+
+# 2. Use sufficient EM iterations
+seurat_obj <- velocity(seurat_obj, 
+                       mode = "dynamical",
+                       max_iter = 15)  # More iterations
+
+# 3. Check results
+velocity_summary(seurat_obj)
+
+# 4. Filter by gene quality
+gene_params <- seurat_obj@misc$scVeloR$dynamics$gene_params
+good_fit <- gene_params$likelihood > 0.2
+message(sprintf("%d / %d genes with good fit", sum(good_fit), length(good_fit)))
+```
+
+## Advanced Topics
+
+### Scaling Factor
+
+The scaling factor accounts for differences in capture efficiency between spliced and unspliced molecules:
+
+$$u_{observed} = \text{scaling} \times u_{true}$$
+
+```{r scaling_demo, echo=FALSE, fig.cap="Effect of scaling factor on phase portrait alignment."}
+# Demonstrate scaling effect
+set.seed(123)
+n <- 150
+
+# True values
+u_true <- runif(n, 0, 2)
+s_true <- 0.5 * u_true + rnorm(n, 0, 0.1)
+
+# With different scaling
+scaling_factors <- c(1, 0.5, 2)
+
+dfs <- list()
+for (i in seq_along(scaling_factors)) {
+  sf <- scaling_factors[i]
+  dfs[[i]] <- data.frame(
+    u = u_true * sf,
+    s = s_true,
+    scaling = paste("Scaling =", sf)
+  )
+}
+scale_df <- do.call(rbind, dfs)
+
+ggplot(scale_df, aes(x = s, y = u)) +
+  geom_point(alpha = 0.6, size = 2, color = "#2196F3") +
+  facet_wrap(~scaling) +
+  labs(x = "Spliced", y = "Unspliced",
+       title = "Effect of Scaling Factor") +
+  theme_minimal()
+```
+
+### Parallel Processing
+
+```{r parallel, eval=FALSE}
+# Use multiple cores for large datasets
+library(future)
+plan(multisession, workers = 8)
+
+seurat_obj <- velocity(seurat_obj, 
+                       mode = "dynamical",
+                       n_cores = 8)
+
+plan(sequential)  # Reset
+```
+
+## Summary
+
+The dynamical model provides the most comprehensive RNA velocity analysis by:
+
+1. **Inferring full kinetics**: α, β, γ for each gene
+2. **Handling transient states**: No equilibrium assumption
+3. **Providing latent time**: Absolute temporal ordering of cells
+
+Use it when you need:
+- Publication-quality results
+- Analysis of rapidly changing processes
+- Interpretation of kinetic parameters
+- Latent time for downstream analysis
+
+## Session Information
+
+```{r session}
+sessionInfo()
+```

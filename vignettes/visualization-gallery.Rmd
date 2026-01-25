@@ -1,0 +1,432 @@
+---
+title: "Visualization Gallery"
+author: "Zaoqu Liu"
+date: "`r Sys.Date()`"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+    fig_width: 8
+    fig_height: 6
+vignette: >
+  %\VignetteIndexEntry{Visualization Gallery}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 8,
+  fig.height = 6,
+  message = FALSE,
+  warning = FALSE,
+  eval = TRUE
+)
+```
+
+## Introduction
+
+**scVeloR** provides a comprehensive suite of visualization tools for exploring RNA velocity results. This gallery demonstrates the various plot types available and their customization options.
+
+```{r load_libraries, eval=FALSE}
+library(scVeloR)
+library(Seurat)
+library(ggplot2)
+```
+
+## Velocity Embedding Plot
+
+The velocity embedding plot shows velocity arrows overlaid on the low-dimensional embedding (UMAP/tSNE).
+
+### Basic Usage
+
+```{r velocity_basic, eval=FALSE}
+# Basic velocity arrows
+plot_velocity(seurat_obj, embedding = "umap")
+
+# Colored by cluster
+plot_velocity(seurat_obj, 
+              embedding = "umap", 
+              color_by = "seurat_clusters")
+
+# Colored by latent time
+plot_velocity(seurat_obj, 
+              embedding = "umap", 
+              color_by = "latent_time")
+```
+
+### Customization Options
+
+```{r velocity_custom, eval=FALSE}
+# Customize arrow appearance
+plot_velocity(seurat_obj,
+              embedding = "umap",
+              color_by = "celltype",
+              arrow_scale = 1.5,      # Arrow length
+              arrow_length = 0.2,     # Arrow head size
+              alpha = 0.8,            # Point transparency
+              size = 0.8,             # Point size
+              n_arrows = 500,         # Subsample arrows
+              title = "RNA Velocity Field")
+```
+
+### Example Output
+
+```{r velocity_demo, echo=FALSE, fig.cap="Velocity embedding plot showing directional flow of cells."}
+library(ggplot2)
+
+# Simulate velocity data for demonstration
+set.seed(42)
+n <- 500
+
+# Create circular trajectory with branches
+theta1 <- runif(n/2, 0, pi)
+theta2 <- runif(n/2, pi, 2*pi)
+theta <- c(theta1, theta2)
+
+r <- 1 + rnorm(n, 0, 0.15)
+x <- r * cos(theta) + rnorm(n, 0, 0.1)
+y <- r * sin(theta) + rnorm(n, 0, 0.1)
+
+# Velocity: tangent to circle
+vx <- -sin(theta) * 0.1 + rnorm(n, 0, 0.02)
+vy <- cos(theta) * 0.1 + rnorm(n, 0, 0.02)
+
+# Clusters
+cluster <- factor(ifelse(theta < pi/2, "A", 
+                         ifelse(theta < pi, "B",
+                                ifelse(theta < 3*pi/2, "C", "D"))))
+
+df <- data.frame(x = x, y = y, vx = vx, vy = vy, cluster = cluster)
+
+# Subsample for arrows
+arrow_idx <- sample(n, 150)
+
+ggplot(df, aes(x = x, y = y)) +
+  geom_point(aes(color = cluster), size = 1.5, alpha = 0.7) +
+  geom_segment(data = df[arrow_idx, ],
+               aes(xend = x + vx, yend = y + vy),
+               arrow = arrow(length = unit(0.1, "cm"), type = "closed"),
+               linewidth = 0.3, alpha = 0.6) +
+  scale_color_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3")) +
+  labs(x = "UMAP_1", y = "UMAP_2", 
+       title = "Velocity Embedding Plot",
+       color = "Cluster") +
+  theme_minimal() +
+  coord_fixed() +
+  theme(legend.position = "right")
+```
+
+## Streamline Plot
+
+Streamlines provide a cleaner visualization of the overall velocity field.
+
+### Basic Usage
+
+```{r stream_basic, eval=FALSE}
+# Basic streamlines
+plot_velocity_stream(seurat_obj, embedding = "umap")
+
+# With custom density
+plot_velocity_stream(seurat_obj,
+                     embedding = "umap",
+                     density = 1.5)
+```
+
+### Example Output
+
+```{r stream_demo, echo=FALSE, fig.cap="Streamline plot showing smooth velocity flow patterns."}
+# Create streamlines
+n_streams <- 30
+streams <- list()
+
+for (i in 1:n_streams) {
+  # Start position
+  t0 <- runif(1, 0, 2*pi)
+  r0 <- 1 + rnorm(1, 0, 0.1)
+  
+  # Generate stream path
+  path_len <- 50
+  stream_x <- numeric(path_len)
+  stream_y <- numeric(path_len)
+  
+  stream_x[1] <- r0 * cos(t0)
+  stream_y[1] <- r0 * sin(t0)
+  
+  for (j in 2:path_len) {
+    # Follow velocity field (tangent)
+    angle <- atan2(stream_y[j-1], stream_x[j-1])
+    vx <- -sin(angle) * 0.03
+    vy <- cos(angle) * 0.03
+    
+    stream_x[j] <- stream_x[j-1] + vx
+    stream_y[j] <- stream_y[j-1] + vy
+  }
+  
+  streams[[i]] <- data.frame(x = stream_x, y = stream_y, group = i)
+}
+
+stream_df <- do.call(rbind, streams)
+
+ggplot() +
+  geom_point(data = df, aes(x = x, y = y, color = cluster), 
+             size = 1, alpha = 0.4) +
+  geom_path(data = stream_df, aes(x = x, y = y, group = group),
+            linewidth = 0.5, alpha = 0.7, color = "black",
+            arrow = arrow(length = unit(0.1, "cm"), type = "closed", ends = "last")) +
+  scale_color_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3")) +
+  labs(x = "UMAP_1", y = "UMAP_2", 
+       title = "Velocity Streamline Plot",
+       color = "Cluster") +
+  theme_minimal() +
+  coord_fixed() +
+  theme(legend.position = "right")
+```
+
+## Grid Plot
+
+The grid plot displays averaged velocities on a regular grid.
+
+### Basic Usage
+
+```{r grid_basic, eval=FALSE}
+# Basic grid
+plot_velocity_grid(seurat_obj, embedding = "umap")
+
+# Custom grid resolution
+plot_velocity_grid(seurat_obj,
+                   embedding = "umap",
+                   n_grid = 50,
+                   arrow_scale = 1.2)
+```
+
+### Example Output
+
+```{r grid_demo, echo=FALSE, fig.cap="Grid plot showing averaged velocity vectors."}
+# Create grid
+grid_n <- 15
+grid_x <- seq(min(x) - 0.2, max(x) + 0.2, length.out = grid_n)
+grid_y <- seq(min(y) - 0.2, max(y) + 0.2, length.out = grid_n)
+
+grid_data <- expand.grid(gx = grid_x, gy = grid_y)
+
+# Average velocity in each grid cell
+grid_data$vx <- 0
+grid_data$vy <- 0
+grid_data$count <- 0
+
+for (i in 1:nrow(grid_data)) {
+  # Find cells near this grid point
+  dist <- sqrt((x - grid_data$gx[i])^2 + (y - grid_data$gy[i])^2)
+  near_idx <- which(dist < 0.3)
+  
+  if (length(near_idx) > 3) {
+    grid_data$vx[i] <- mean(vx[near_idx])
+    grid_data$vy[i] <- mean(vy[near_idx])
+    grid_data$count[i] <- length(near_idx)
+  }
+}
+
+# Filter grid points with sufficient data
+grid_data <- grid_data[grid_data$count > 3, ]
+
+ggplot() +
+  geom_point(data = df, aes(x = x, y = y, color = cluster), 
+             size = 1, alpha = 0.3) +
+  geom_segment(data = grid_data,
+               aes(x = gx, y = gy, xend = gx + vx, yend = gy + vy),
+               arrow = arrow(length = unit(0.12, "cm"), type = "closed"),
+               linewidth = 0.5, color = "black", alpha = 0.8) +
+  scale_color_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3")) +
+  labs(x = "UMAP_1", y = "UMAP_2", 
+       title = "Velocity Grid Plot",
+       color = "Cluster") +
+  theme_minimal() +
+  coord_fixed() +
+  theme(legend.position = "right")
+```
+
+## Phase Portrait
+
+Phase portraits show the relationship between spliced and unspliced mRNA for individual genes.
+
+### Basic Usage
+
+```{r phase_basic, eval=FALSE}
+# Single gene phase portrait
+plot_phase(seurat_obj, gene = "Sox2")
+
+# With fitted dynamics
+plot_phase(seurat_obj, 
+           gene = "Sox2", 
+           show_fit = TRUE)
+
+# Colored by latent time
+plot_phase(seurat_obj,
+           gene = "Sox2",
+           color_by = "latent_time",
+           show_fit = TRUE)
+```
+
+### Example Output
+
+```{r phase_demo, echo=FALSE, fig.cap="Phase portrait showing spliced vs unspliced mRNA relationship."}
+# Simulate gene expression data
+set.seed(123)
+n_cells <- 300
+
+# Create trajectory
+t_cells <- runif(n_cells, 0, 2)
+t_switch <- 1
+
+# Parameters
+alpha <- 2
+beta <- 0.5
+gamma <- 0.3
+
+# Induction phase
+u_ind <- alpha/beta * (1 - exp(-beta * t_cells[t_cells < t_switch]))
+s_ind <- alpha/gamma * (1 - exp(-gamma * t_cells[t_cells < t_switch])) + 
+         alpha/(gamma - beta) * (exp(-gamma * t_cells[t_cells < t_switch]) - 
+                                  exp(-beta * t_cells[t_cells < t_switch]))
+
+# Values at switch
+u_switch <- alpha/beta * (1 - exp(-beta * t_switch))
+s_switch <- alpha/gamma * (1 - exp(-gamma * t_switch)) + 
+            alpha/(gamma - beta) * (exp(-gamma * t_switch) - exp(-beta * t_switch))
+
+# Repression phase
+t_rep <- t_cells[t_cells >= t_switch] - t_switch
+u_rep <- u_switch * exp(-beta * t_rep)
+s_rep <- s_switch * exp(-gamma * t_rep) + 
+         beta * u_switch / (gamma - beta) * (exp(-gamma * t_rep) - exp(-beta * t_rep))
+
+# Combine
+u_all <- c(u_ind, u_rep) + rnorm(n_cells, 0, 0.1)
+s_all <- c(s_ind, s_rep) + rnorm(n_cells, 0, 0.1)
+u_all[u_all < 0] <- 0
+s_all[s_all < 0] <- 0
+
+phase_df <- data.frame(
+  s = s_all,
+  u = u_all,
+  latent_time = t_cells
+)
+
+# Create fitted curve
+t_fit <- seq(0, 2, length.out = 200)
+u_fit <- ifelse(t_fit < t_switch,
+                alpha/beta * (1 - exp(-beta * t_fit)),
+                u_switch * exp(-beta * (t_fit - t_switch)))
+
+s_fit <- ifelse(t_fit < t_switch,
+                alpha/gamma * (1 - exp(-gamma * t_fit)) + 
+                  alpha/(gamma - beta) * (exp(-gamma * t_fit) - exp(-beta * t_fit)),
+                s_switch * exp(-gamma * (t_fit - t_switch)) + 
+                  beta * u_switch / (gamma - beta) * 
+                  (exp(-gamma * (t_fit - t_switch)) - exp(-beta * (t_fit - t_switch))))
+
+fit_df <- data.frame(s = s_fit, u = u_fit)
+
+ggplot(phase_df, aes(x = s, y = u, color = latent_time)) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  geom_path(data = fit_df, aes(x = s, y = u), 
+            color = "red", linewidth = 1.2, inherit.aes = FALSE) +
+  scale_color_viridis_c(option = "plasma") +
+  labs(x = "Spliced", y = "Unspliced",
+       title = "Phase Portrait: Gene Expression Dynamics",
+       color = "Latent\nTime") +
+  theme_minimal() +
+  annotate("text", x = max(s_all) * 0.8, y = max(u_all) * 0.9, 
+           label = "Fitted trajectory", color = "red", hjust = 0)
+```
+
+## Latent Time Visualization
+
+### Example Output
+
+```{r latent_time_demo, echo=FALSE, fig.cap="Cells colored by inferred latent time."}
+# Use the simulated data
+df$latent_time <- (theta - min(theta)) / (max(theta) - min(theta))
+
+ggplot(df, aes(x = x, y = y, color = latent_time)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_viridis_c(option = "viridis") +
+  labs(x = "UMAP_1", y = "UMAP_2",
+       title = "Latent Time on Embedding",
+       color = "Latent\nTime") +
+  theme_minimal() +
+  coord_fixed()
+```
+
+## Velocity Confidence
+
+```{r confidence_demo, echo=FALSE, fig.cap="Velocity confidence scores indicating reliability of estimates."}
+# Simulate confidence scores
+df$confidence <- pmax(0, 1 - abs(rnorm(n, 0, 0.3)))
+
+ggplot(df, aes(x = x, y = y, color = confidence)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_gradient(low = "#FFECB3", high = "#E65100") +
+  labs(x = "UMAP_1", y = "UMAP_2",
+       title = "Velocity Confidence Scores",
+       color = "Confidence") +
+  theme_minimal() +
+  coord_fixed()
+```
+
+## Combined Visualizations
+
+### Multi-panel Figure
+
+```{r multi_panel, eval=FALSE}
+library(patchwork)
+
+# Create multiple plots
+p1 <- plot_velocity(seurat_obj, embedding = "umap", 
+                    color_by = "clusters", title = "Velocity")
+p2 <- plot_velocity_stream(seurat_obj, embedding = "umap",
+                           title = "Streamlines")
+p3 <- plot_phase(seurat_obj, gene = "Sox2", 
+                 show_fit = TRUE, title = "Sox2 Phase")
+
+# Combine
+(p1 | p2) / p3
+```
+
+## Customizing Colors
+
+```{r colors, eval=FALSE}
+# Custom color palette for clusters
+custom_colors <- c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", 
+                   "#FF7F00", "#FFFF33", "#A65628", "#F781BF")
+
+plot_velocity(seurat_obj, 
+              embedding = "umap",
+              color_by = "clusters") +
+  ggplot2::scale_color_manual(values = custom_colors)
+
+# Custom continuous color scale
+plot_velocity(seurat_obj,
+              embedding = "umap",
+              color_by = "latent_time") +
+  ggplot2::scale_color_viridis_c(option = "magma")
+```
+
+## Exporting Figures
+
+```{r export, eval=FALSE}
+# High-resolution export
+p <- plot_velocity(seurat_obj, embedding = "umap")
+
+ggsave("velocity_plot.pdf", p, width = 8, height = 6, dpi = 300)
+ggsave("velocity_plot.png", p, width = 8, height = 6, dpi = 300)
+```
+
+## Session Information
+
+```{r session}
+sessionInfo()
+```

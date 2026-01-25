@@ -1,0 +1,72 @@
+url: https://zaoqu-liu.github.io/scVeloR/
+
+template:
+  bootstrap: 5
+  bootswatch: flatly
+  bslib:
+    primary: "#0d6efd"
+    border-radius: 0.5rem
+    btn-border-radius: 0.25rem
+
+home:
+  title: scVeloR - RNA Velocity Analysis in R
+  description: >
+    A comprehensive R implementation of RNA velocity analysis for single-cell
+    transcriptomics, enabling inference of cellular dynamics from spliced and
+    unspliced mRNA.
+
+authors:
+  Zaoqu Liu:
+    href: https://github.com/Zaoqu-Liu
+
+navbar:
+  structure:
+    left: [intro, articles, news]
+    right: [search, github]
+  components:
+    intro:
+      text: Get Started
+      href: articles/scVeloR-tutorial.html
+    articles:
+      text: Articles
+      menu:
+        - text: "Quick Start Tutorial"
+          href: articles/scVeloR-tutorial.html
+        - text: "---"
+        - text: "Mathematical Framework"
+          href: articles/algorithm-theory.html
+        - text: "Dynamical Model Deep Dive"
+          href: articles/dynamical-model.html
+        - text: "---"
+        - text: "Visualization Gallery"
+          href: articles/visualization-gallery.html
+        - text: "Model Comparison"
+          href: articles/model-comparison.html
+        - text: "Performance Guide"
+          href: articles/performance-guide.html
+    github:
+      icon: fab fa-github
+      href: https://github.com/Zaoqu-Liu/scVeloR
+      aria-label: GitHub
+
+articles:
+  - title: Getting Started
+    navbar: ~
+    contents:
+      - scVeloR-tutorial
+  
+  - title: Mathematical Background
+    contents:
+      - algorithm-theory
+      - dynamical-model
+  
+  - title: Practical Guides
+    contents:
+      - visualization-gallery
+      - model-comparison
+      - performance-guide
+
+footer:
+  structure:
+    left: developed_by
+    right: built_with

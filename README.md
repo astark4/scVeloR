@@ -2,6 +2,8 @@
 
 ## RNA Velocity Analysis for Single-Cell Transcriptomics in R
 
+📚 **Documentation**: <https://zaoqu-liu.github.io/scVeloR/>
+
 <!-- badges: start -->
 [![R-universe](https://zaoqu-liu.r-universe.dev/badges/scVeloR)](https://zaoqu-liu.r-universe.dev/scVeloR)
 [![R-CMD-check](https://github.com/Zaoqu-Liu/scVeloR/workflows/R-CMD-check/badge.svg)](https://github.com/Zaoqu-Liu/scVeloR/actions)

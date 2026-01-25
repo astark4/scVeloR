@@ -1,0 +1,291 @@
+---
+title: "Mathematical Framework of RNA Velocity"
+author: "Zaoqu Liu"
+date: "`r Sys.Date()`"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+    fig_width: 7
+    fig_height: 5
+vignette: >
+  %\VignetteIndexEntry{Mathematical Framework of RNA Velocity}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 5,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Introduction
+
+This vignette provides a comprehensive overview of the mathematical framework underlying RNA velocity analysis as implemented in **scVeloR**. Understanding these principles is essential for proper interpretation of velocity results and for making informed decisions about model selection.
+
+## The Central Dogma and mRNA Kinetics
+
+### Biological Background
+
+Gene expression involves a series of biochemical processes:
+
+1. **Transcription**: DNA → pre-mRNA (nascent/unspliced)
+2. **Splicing**: pre-mRNA → mature mRNA (spliced)
+3. **Degradation**: mRNA → degraded products
+
+RNA velocity leverages the distinction between **unspliced** (nascent) and **spliced** (mature) mRNA to infer the direction and rate of gene expression changes.
+
+### The Kinetic Model
+
+The dynamics of mRNA abundance can be described by a system of ordinary differential equations (ODEs):
+
+$$\frac{du}{dt} = \alpha(t) - \beta u$$
+
+$$\frac{ds}{dt} = \beta u - \gamma s$$
+
+Where:
+
+- $u$: unspliced mRNA abundance
+- $s$: spliced mRNA abundance
+- $\alpha(t)$: transcription rate (time-dependent)
+- $\beta$: splicing rate (constitutive)
+- $\gamma$: degradation rate (constitutive)
+
+## Analytical Solutions
+
+### Constant Transcription (Induction Phase)
+
+When $\alpha(t) = \alpha$ (constant), the system has analytical solutions:
+
+**Unspliced mRNA:**
+$$u(t) = u_0 e^{-\beta t} + \frac{\alpha}{\beta}(1 - e^{-\beta t})$$
+
+**Spliced mRNA:**
+$$s(t) = s_0 e^{-\gamma t} + \frac{\alpha}{\gamma}(1 - e^{-\gamma t}) + \frac{\alpha - u_0 \beta}{\gamma - \beta}(e^{-\gamma t} - e^{-\beta t})$$
+
+### Zero Transcription (Repression Phase)
+
+When transcription stops ($\alpha = 0$):
+
+$$u(t) = u_0 e^{-\beta t}$$
+
+$$s(t) = s_0 e^{-\gamma t} + \frac{\beta u_0}{\gamma - \beta}(e^{-\gamma t} - e^{-\beta t})$$
+
+### Steady State
+
+At equilibrium ($du/dt = 0$, $ds/dt = 0$):
+
+$$u_{ss} = \frac{\alpha}{\beta}$$
+
+$$s_{ss} = \frac{\alpha}{\gamma}$$
+
+The ratio at steady state defines a fundamental relationship:
+
+$$\frac{u_{ss}}{s_{ss}} = \frac{\gamma}{\beta}$$
+
+```{r ode_visualization, echo=FALSE, fig.cap="Phase portrait showing the trajectory of gene expression during induction (blue) and repression (red) phases."}
+# Visualize ODE solutions
+library(ggplot2)
+
+# Parameters
+alpha <- 1
+beta <- 0.5
+gamma <- 0.3
+t_switch <- 5
+
+# Time points
+t_on <- seq(0, t_switch, length.out = 100)
+t_off <- seq(0, 10, length.out = 100)
+
+# Induction phase
+u_on <- alpha/beta * (1 - exp(-beta * t_on))
+s_on <- alpha/gamma * (1 - exp(-gamma * t_on)) + 
+        (alpha)/(gamma - beta) * (exp(-gamma * t_on) - exp(-beta * t_on))
+
+# Values at switch point
+u0_switch <- tail(u_on, 1)
+s0_switch <- tail(s_on, 1)
+
+# Repression phase
+u_off <- u0_switch * exp(-beta * t_off)
+s_off <- s0_switch * exp(-gamma * t_off) + 
+         (beta * u0_switch)/(gamma - beta) * (exp(-gamma * t_off) - exp(-beta * t_off))
+
+# Combine data
+df <- data.frame(
+  s = c(s_on, s_off),
+  u = c(u_on, u_off),
+  phase = rep(c("Induction", "Repression"), c(length(s_on), length(s_off)))
+)
+
+# Plot
+ggplot(df, aes(x = s, y = u, color = phase)) +
+  geom_path(linewidth = 1.2, arrow = arrow(length = unit(0.3, "cm"), type = "closed")) +
+  geom_point(data = data.frame(s = c(0, alpha/gamma, 0), 
+                                u = c(0, alpha/beta, 0),
+                                label = c("Start", "Steady State", "End")),
+             aes(x = s, y = u), size = 3, color = "black") +
+  annotate("text", x = alpha/gamma * 1.05, y = alpha/beta, label = "Steady State", hjust = 0) +
+  scale_color_manual(values = c("Induction" = "#2196F3", "Repression" = "#F44336")) +
+  labs(x = "Spliced (s)", y = "Unspliced (u)", 
+       title = "Phase Portrait of mRNA Dynamics",
+       subtitle = expression(paste(alpha, " = 1, ", beta, " = 0.5, ", gamma, " = 0.3"))) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Velocity Estimation Models
+
+### Model 1: Deterministic (Steady-State)
+
+**Assumption**: Cells are near transcriptional steady state.
+
+At steady state: $\gamma \approx \beta u / s$
+
+**Velocity**: The deviation from steady state indicates the direction of change:
+
+$$v_s = \beta u - \gamma s$$
+
+If $v_s > 0$: gene is being upregulated
+If $v_s < 0$: gene is being downregulated
+
+**Implementation in scVeloR**:
+
+```{r steady_state_demo, eval=FALSE}
+# Fit gamma by linear regression of u vs s
+# v_s = β·u - γ·s = β(u - γ/β·s)
+# Use regression: u ~ s to get slope γ/β
+```
+
+### Model 2: Stochastic
+
+**Assumption**: Account for transcriptional noise through second-order moments.
+
+The stochastic model uses both first moments (mean expression) and second moments (variance, covariance):
+
+$$\text{Var}(u) = E[u^2] - E[u]^2$$
+$$\text{Cov}(u,s) = E[us] - E[u]E[s]$$
+
+This provides more robust velocity estimates when transcriptional bursting is present.
+
+### Model 3: Dynamical
+
+**Assumption**: Full kinetics model without steady-state assumption.
+
+The dynamical model infers all kinetic parameters ($\alpha$, $\beta$, $\gamma$) and the switching time ($t_-$) using an Expectation-Maximization (EM) algorithm.
+
+**E-step**: Assign latent time to each cell
+**M-step**: Update kinetic parameters
+
+```{r em_algorithm, echo=FALSE, fig.cap="EM algorithm iteratively refines parameter estimates and time assignments."}
+# Illustrate EM convergence
+set.seed(42)
+iterations <- 10
+likelihood <- cumsum(runif(iterations, 0.1, 0.3)) + 1
+likelihood <- likelihood / max(likelihood)
+
+df_em <- data.frame(
+  iteration = 1:iterations,
+  likelihood = likelihood
+)
+
+ggplot(df_em, aes(x = iteration, y = likelihood)) +
+  geom_line(color = "#673AB7", linewidth = 1) +
+  geom_point(color = "#673AB7", size = 3) +
+  labs(x = "EM Iteration", y = "Log-Likelihood",
+       title = "EM Algorithm Convergence") +
+  theme_minimal() +
+  scale_x_continuous(breaks = 1:10)
+```
+
+## Velocity Graph Construction
+
+### Cosine Similarity
+
+The velocity graph captures cell-cell transitions based on velocity correlation:
+
+$$\text{cosine}(v_i, \delta_{ij}) = \frac{v_i \cdot \delta_{ij}}{||v_i|| \cdot ||\delta_{ij}||}$$
+
+Where:
+- $v_i$: velocity vector for cell $i$
+- $\delta_{ij}$: expression difference between cell $i$ and $j$
+
+### Transition Probability
+
+The transition probability from cell $i$ to cell $j$:
+
+$$P_{ij} = \frac{\max(0, \text{cosine}(v_i, \delta_{ij}))}{\sum_k \max(0, \text{cosine}(v_i, \delta_{ik}))}$$
+
+```{r transition_matrix, echo=FALSE, fig.cap="Schematic of velocity-based transition probabilities."}
+# Illustrate transition concept
+set.seed(123)
+n <- 20
+theta <- seq(0, 2*pi, length.out = n)
+r <- runif(n, 0.8, 1.2)
+x <- r * cos(theta) + rnorm(n, 0, 0.1)
+y <- r * sin(theta) + rnorm(n, 0, 0.1)
+
+# Add velocity vectors (tangent to circle + noise)
+vx <- -sin(theta) * 0.15 + rnorm(n, 0, 0.02)
+vy <- cos(theta) * 0.15 + rnorm(n, 0, 0.02)
+
+df_cells <- data.frame(x = x, y = y, vx = vx, vy = vy)
+
+ggplot(df_cells, aes(x = x, y = y)) +
+  geom_point(size = 3, color = "#2196F3", alpha = 0.8) +
+  geom_segment(aes(xend = x + vx, yend = y + vy),
+               arrow = arrow(length = unit(0.15, "cm"), type = "closed"),
+               color = "#F44336", linewidth = 0.5) +
+  labs(title = "Velocity Vectors on Cell Embedding",
+       subtitle = "Arrows indicate predicted future state") +
+  theme_minimal() +
+  theme(axis.text = element_blank(),
+        axis.title = element_blank()) +
+  coord_fixed()
+```
+
+## Latent Time Inference
+
+### Gene-Shared Latent Time
+
+The latent time represents the position of each cell along the differentiation trajectory:
+
+$$t_i = \frac{1}{|G|} \sum_{g \in G} t_{ig}$$
+
+Where $t_{ig}$ is the inferred time for cell $i$ based on gene $g$.
+
+### Root Cell Identification
+
+The root cells are identified as those with:
+1. High connectivity in the velocity graph
+2. Velocity vectors pointing "outward" (high end-point probability)
+
+## Model Selection Guidelines
+
+| Criterion | Steady-State | Stochastic | Dynamical |
+|-----------|--------------|------------|-----------|
+| Speed | Fast | Medium | Slow |
+| Data requirement | Low | Medium | High |
+| Transcriptional dynamics | Equilibrium | Bursting | Transient |
+| Parameter inference | γ only | γ only | α, β, γ, t_ |
+| Recommended use | Exploration | Default | Publication |
+
+## References
+
+1. **Bergen, V., Lange, M., Peidli, S., Wolf, F. A., & Theis, F. J.** (2020). Generalizing RNA velocity to transient cell states through dynamical modeling. *Nature Biotechnology*, 38, 1408–1414.
+
+2. **La Manno, G., Soldatov, R., Zeisel, A., et al.** (2018). RNA velocity of single cells. *Nature*, 560, 494–498.
+
+3. **Svensson, V., & Pachter, L.** (2018). RNA velocity: Molecular kinetics from single-cell RNA-seq. *Molecular Cell*, 72, 7–9.
+
+## Session Information
+
+```{r session_info}
+sessionInfo()
+```
