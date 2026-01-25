@@ -1,468 +1,828 @@
 #' @title Dynamical Velocity Model
-#' @description Functions for recovering RNA dynamics using the EM algorithm.
+#' @description Recover full splicing kinetics using the EM algorithm.
+#' The dynamical model infers transcription rates (alpha), splicing rates (beta),
+#' degradation rates (gamma), as well as cell-specific latent time and
+#' transcriptional states.
 #' @name velocity_dynamical
 NULL
 
 #' Recover Dynamics
 #'
-#' @description Recover the full splicing dynamics using an expectation-maximization
-#' algorithm. This fits transcription, splicing, and degradation rates for each gene.
+#' @description Main function to recover transcriptional dynamics using the 
+#' dynamical model with EM optimization.
 #'
-#' @param seurat_obj A Seurat object with computed moments
-#' @param var_names Gene names to fit, or "velocity_genes" to use filtered genes
-#' @param n_top_genes Number of top genes to use if var_names is numeric
-#' @param max_iter Maximum EM iterations per gene (default: 10)
-#' @param fit_time Whether to fit time for each cell (default: TRUE)
-#' @param fit_scaling Whether to fit scaling between u and s (default: TRUE)
-#' @param fit_steady_states Fit steady states (default: TRUE)
-#' @param fit_connected_states Only fit states with neighbors (default: FALSE)
-#' @param t_max Maximum time to consider (default: 20)
-#' @param eps Convergence threshold (default: 1e-4)
-#' @param n_jobs Number of parallel jobs (default: 1)
+#' @param object Seurat object
+#' @param genes Character vector of gene names, or "velocity_genes"
+#' @param n_top_genes Maximum number of top genes to use
+#' @param max_iter Maximum EM iterations
+#' @param fit_scaling Whether to fit scaling between unspliced and spliced
+#' @param fit_time Whether to fit cell times
+#' @param t_max Total time range for alignment (default 20)
+#' @param min_likelihood Minimum likelihood threshold for genes
+#' @param n_cores Number of cores for parallel processing
+#' @param verbose Print progress
+#' @param spliced_layer Name of spliced layer
+#' @param unspliced_layer Name of unspliced layer
+#' @param use_moments Whether to use moment-based estimates (Ms, Mu)
 #'
-#' @return Modified Seurat object with fitted dynamics parameters
-#'
+#' @return Seurat object with dynamics parameters in misc$scVeloR$dynamics
 #' @export
-recover_dynamics <- function(seurat_obj,
-                               var_names = "velocity_genes",
-                               n_top_genes = NULL,
-                               max_iter = 10L,
-                               fit_time = TRUE,
-                               fit_scaling = TRUE,
-                               fit_steady_states = TRUE,
-                               fit_connected_states = FALSE,
-                               t_max = 20,
-                               eps = 1e-4,
-                               n_jobs = 1L) {
+recover_dynamics <- function(object, 
+                             genes = "velocity_genes",
+                             n_top_genes = NULL,
+                             max_iter = 10,
+                             fit_scaling = TRUE,
+                             fit_time = TRUE,
+                             t_max = 20,
+                             min_likelihood = 0.1,
+                             n_cores = 1,
+                             verbose = TRUE,
+                             spliced_layer = "spliced",
+                             unspliced_layer = "unspliced",
+                             use_moments = TRUE) {
   
-  .vmessage("Recovering dynamics")
+  # Get data matrices
+  data <- get_velocity_data(object, spliced_layer, unspliced_layer, use_moments)
+  Ms <- data$Ms
+  Mu <- data$Mu
   
-  # Get expression data
-  if (!.layer_exists(seurat_obj, "Ms") || !.layer_exists(seurat_obj, "Mu")) {
-    stop("Moments not found. Run compute_moments first.", call. = FALSE)
+  # Determine genes to fit
+  gene_names <- colnames(Ms)
+  
+  if (is.character(genes) && length(genes) == 1) {
+    if (genes == "velocity_genes" || genes == "all") {
+      # Use velocity genes if available
+      if (!is.null(object@misc$scVeloR$velocity$velocity_genes)) {
+        velocity_genes <- object@misc$scVeloR$velocity$velocity_genes
+        genes <- gene_names[velocity_genes]
+      } else {
+        genes <- gene_names
+      }
+    } else if (genes %in% names(object@misc$scVeloR)) {
+      genes <- object@misc$scVeloR[[genes]]
+    }
   }
   
-  Ms <- make_dense(.get_layer_data(seurat_obj, "Ms"))
-  Mu <- make_dense(.get_layer_data(seurat_obj, "Mu"))
+  # Filter to valid genes
+  genes <- intersect(genes, gene_names)
   
-  # Get genes to fit
-  if (is.character(var_names) && var_names == "velocity_genes") {
-    genes <- velocity_genes(seurat_obj)
-  } else if (is.numeric(var_names)) {
-    genes <- velocity_genes(seurat_obj, n_top_genes = var_names)
-  } else {
-    genes <- var_names
-  }
-  
-  # Limit to top genes if specified
+  # Limit number of genes
   if (!is.null(n_top_genes) && length(genes) > n_top_genes) {
-    genes <- genes[seq_len(n_top_genes)]
+    gene_totals <- colSums(Ms[, genes, drop = FALSE])
+    genes <- genes[order(gene_totals, decreasing = TRUE)[1:n_top_genes]]
   }
   
-  genes <- intersect(genes, rownames(Ms))
   n_genes <- length(genes)
-  n_cells <- ncol(Ms)
+  n_cells <- nrow(Ms)
   
-  .vmessage("Fitting dynamics for ", n_genes, " genes")
+  if (verbose) {
+    message(sprintf("Recovering dynamics for %d genes using %d cores...", n_genes, n_cores))
+  }
   
-  # Initialize parameter storage
-  params <- data.frame(
-    row.names = rownames(Ms),
-    fit_alpha = NA_real_,
-    fit_beta = NA_real_,
-    fit_gamma = NA_real_,
-    fit_t_ = NA_real_,
-    fit_scaling = NA_real_,
-    fit_alignment = NA_real_,
-    fit_likelihood = NA_real_,
-    fit_pval_steady = NA_real_,
-    fit_pval_dyn = NA_real_
-  )
+  # Get connectivities for connected state fitting
+  conn <- NULL
+  if (!is.null(object@misc$scVeloR$neighbors$connectivities)) {
+    conn <- object@misc$scVeloR$neighbors$connectivities
+  }
   
-  # Storage for latent time
-  latent_time <- matrix(NA_real_, nrow = n_genes, ncol = n_cells)
-  rownames(latent_time) <- rownames(Ms)
-  colnames(latent_time) <- colnames(Ms)
+  # Initialize result containers
+  alpha <- rep(NA_real_, n_genes)
+  beta <- rep(NA_real_, n_genes)
+  gamma <- rep(NA_real_, n_genes)
+  t_ <- rep(NA_real_, n_genes)
+  scaling <- rep(NA_real_, n_genes)
+  std_u <- rep(NA_real_, n_genes)
+  std_s <- rep(NA_real_, n_genes)
+  likelihood <- rep(NA_real_, n_genes)
+  variance <- rep(NA_real_, n_genes)
   
-  # Fit each gene
-  fit_single_gene <- function(gene) {
-    u <- Mu[gene, ]
-    s <- Ms[gene, ]
+  T_matrix <- matrix(NA_real_, n_cells, n_genes)
+  Tau_matrix <- matrix(NA_real_, n_cells, n_genes)
+  O_matrix <- matrix(NA_integer_, n_cells, n_genes)
+  
+  # Fit dynamics for each gene
+  gene_indices <- match(genes, gene_names)
+  
+  fit_gene <- function(i) {
+    idx <- gene_indices[i]
+    gene <- genes[i]
     
-    # Fit dynamics
-    result <- fit_dynamics_gene(u, s, 
-                                 max_iter = max_iter,
-                                 fit_time = fit_time,
-                                 fit_scaling = fit_scaling,
-                                 t_max = t_max,
-                                 eps = eps)
+    u <- Mu[, idx]
+    s <- Ms[, idx]
     
-    return(result)
+    tryCatch({
+      dm <- dynamics_recovery(
+        u = u, s = s,
+        gene = gene,
+        max_iter = max_iter,
+        fit_scaling = fit_scaling,
+        fit_time = fit_time,
+        conn = conn
+      )
+      
+      list(
+        success = dm$recoverable,
+        alpha = dm$alpha,
+        beta = dm$beta,
+        gamma = dm$gamma,
+        t_ = dm$t_,
+        scaling = dm$scaling,
+        std_u = dm$std_u,
+        std_s = dm$std_s,
+        likelihood = dm$likelihood,
+        variance = dm$variance,
+        t = dm$t,
+        tau = dm$tau,
+        o = dm$o
+      )
+    }, error = function(e) {
+      list(success = FALSE)
+    })
   }
   
   # Run fitting
-  results <- apply_with_progress(
-    genes,
-    fit_single_gene,
-    n_jobs = n_jobs,
-    show_progress = TRUE
-  )
-  
-  # Extract results
-  for (i in seq_along(genes)) {
-    gene <- genes[i]
-    if (!is.null(results[[i]]) && !is.null(results[[i]]$alpha)) {
-      params[gene, "fit_alpha"] <- results[[i]]$alpha
-      params[gene, "fit_beta"] <- results[[i]]$beta
-      params[gene, "fit_gamma"] <- results[[i]]$gamma
-      params[gene, "fit_t_"] <- results[[i]]$t_
-      params[gene, "fit_scaling"] <- results[[i]]$scaling
-      params[gene, "fit_likelihood"] <- results[[i]]$likelihood
-      
-      if (!is.null(results[[i]]$tau)) {
-        latent_time[gene, ] <- results[[i]]$tau
-      }
-    }
-  }
-  
-  # Store parameters
-  seurat_obj <- store_fit_params(seurat_obj, params)
-  seurat_obj@misc$latent_time <- latent_time
-  seurat_obj@misc$dynamics_recovered <- TRUE
-  
-  n_fit <- sum(!is.na(params$fit_alpha))
-  .vmessage("Recovered dynamics for ", n_fit, " genes")
-  
-  return(seurat_obj)
-}
-
-#' Fit Dynamics for Single Gene
-#'
-#' @description Fit splicing dynamics for a single gene using EM algorithm.
-#'
-#' @param u Unspliced values
-#' @param s Spliced values
-#' @param max_iter Maximum iterations
-#' @param fit_time Whether to fit cell times
-#' @param fit_scaling Whether to fit scaling
-#' @param t_max Maximum time
-#' @param eps Convergence threshold
-#' @return List with fitted parameters
-#' @keywords internal
-fit_dynamics_gene <- function(u, s, max_iter = 10, fit_time = TRUE,
-                               fit_scaling = TRUE, t_max = 20, eps = 1e-4) {
-  
-  n <- length(u)
-  
-  # Remove NAs and zeros
-  valid <- !is.na(u) & !is.na(s) & (u > 0 | s > 0)
-  if (sum(valid) < 20) {
-    return(NULL)
-  }
-  
-  u <- u[valid]
-  s <- s[valid]
-  n_valid <- length(u)
-  
-  # Initialize parameters from steady-state
-  gamma_init <- sum(u * s) / sum(s^2)
-  if (gamma_init <= 0 || !is.finite(gamma_init)) gamma_init <- 0.1
-  
-  beta_init <- gamma_init
-  alpha_init <- gamma_init * max(s) / 2
-  
-  # Initial time estimate
-  t_init <- t_max / 2
-  scaling <- max(s) / max(u)
-  if (!is.finite(scaling) || scaling <= 0) scaling <- 1
-  
-  # Scale u
-  u_scaled <- u * scaling
-  
-  # EM iterations
-  alpha <- alpha_init
-  beta <- beta_init
-  gamma <- gamma_init
-  t_ <- t_init
-  
-  prev_likelihood <- -Inf
-  
-  for (iter in seq_len(max_iter)) {
-    # E-step: Assign cells to time points
-    if (fit_time) {
-      # Estimate tau for each cell
-      tau <- tau_inv_u_cpp(u_scaled, 0, alpha, beta)
-      tau <- pmax(0, pmin(tau, t_max))
-    } else {
-      tau <- rep(t_ / 2, n_valid)
-    }
-    
-    # Get predicted values
-    dynamics <- mRNA_dynamics_cpp(tau, 0, 0, alpha, beta, gamma)
-    u_pred <- dynamics$u
-    s_pred <- dynamics$s
-    
-    # Compute likelihood (MSE-based)
-    mse <- compute_mse_cpp(u_scaled, s, u_pred, s_pred)
-    likelihood <- -mse
-    
-    # Check convergence
-    if (abs(likelihood - prev_likelihood) < eps) {
-      break
-    }
-    prev_likelihood <- likelihood
-    
-    # M-step: Update parameters
-    
-    # Update gamma: gamma = sum(beta*u*s) / sum(s^2)
-    ss_sum <- sum(s^2)
-    if (ss_sum > 0) {
-      gamma_new <- beta * sum(u_scaled * s) / ss_sum
-      if (is.finite(gamma_new) && gamma_new > 0) {
-        gamma <- gamma_new
-      }
-    }
-    
-    # Update alpha and beta jointly
-    # Use simplified update based on steady-state levels
-    u_max <- max(u_scaled)
-    s_max <- max(s)
-    
-    if (u_max > 0 && s_max > 0) {
-      # At steady state: u_ss = alpha/beta, s_ss = alpha/gamma
-      alpha_new <- gamma * s_max * 0.8  # Factor for non-steady cells
-      beta_new <- alpha_new / u_max * 1.2
-      
-      if (is.finite(alpha_new) && alpha_new > 0) alpha <- alpha_new
-      if (is.finite(beta_new) && beta_new > 0) beta <- beta_new
-    }
-    
-    # Update t_ (switching time)
-    if (fit_time) {
-      # Estimate t_ as time when transcription switches off
-      t_ <- stats::quantile(tau[tau > 0], 0.9, na.rm = TRUE)
-      if (!is.finite(t_)) t_ <- t_max / 2
-    }
-  }
-  
-  # Final likelihood
-  if (fit_time) {
-    tau <- tau_inv_u_cpp(u_scaled, 0, alpha, beta)
-    tau <- pmax(0, pmin(tau, t_max))
+  if (n_cores > 1 && requireNamespace("parallel", quietly = TRUE)) {
+    results <- parallel::mclapply(seq_len(n_genes), fit_gene, mc.cores = n_cores)
   } else {
-    tau <- rep(t_ / 2, n_valid)
+    results <- lapply(seq_len(n_genes), function(i) {
+      if (verbose && i %% 100 == 0) {
+        message(sprintf("  Fitted %d/%d genes", i, n_genes))
+      }
+      fit_gene(i)
+    })
   }
   
-  dynamics <- mRNA_dynamics_cpp(tau, 0, 0, alpha, beta, gamma)
-  mse <- compute_mse_cpp(u_scaled, s, dynamics$u, dynamics$s)
-  likelihood <- exp(-mse)  # Convert to probability-like scale
-  
-  # Rescale parameters
-  if (fit_scaling) {
-    alpha <- alpha / scaling
-    beta <- beta
-    gamma <- gamma
+  # Collect results
+  n_success <- 0
+  for (i in seq_len(n_genes)) {
+    res <- results[[i]]
+    if (res$success) {
+      n_success <- n_success + 1
+      alpha[i] <- res$alpha
+      beta[i] <- res$beta / res$scaling  # Unscale beta
+      gamma[i] <- res$gamma
+      t_[i] <- res$t_
+      scaling[i] <- res$scaling
+      std_u[i] <- res$std_u
+      std_s[i] <- res$std_s
+      likelihood[i] <- res$likelihood
+      variance[i] <- res$variance
+      T_matrix[, i] <- res$t
+      Tau_matrix[, i] <- res$tau
+      O_matrix[, i] <- res$o
+    }
   }
   
-  # Expand tau back to full array
-  tau_full <- rep(NA_real_, length(valid))
-  tau_full[valid] <- tau
+  if (verbose) {
+    message(sprintf("  Successfully fitted %d/%d genes", n_success, n_genes))
+  }
   
-  list(
+  # Align dynamics to common time scale
+  if (!is.null(t_max) && t_max != FALSE) {
+    alignment_result <- align_dynamics(
+      T_matrix, t_, alpha, beta, gamma, scaling,
+      t_max = t_max
+    )
+    
+    T_matrix <- alignment_result$T
+    t_ <- alignment_result$t_
+    alpha <- alignment_result$alpha
+    beta <- alignment_result$beta
+    gamma <- alignment_result$gamma
+    alignment_scaling <- alignment_result$alignment_scaling
+  } else {
+    alignment_scaling <- rep(1, n_genes)
+  }
+  
+  # Smooth time with connectivities
+  if (!is.null(conn)) {
+    for (i in which(!is.na(t_))) {
+      T_matrix[, i] <- as.vector(conn %*% T_matrix[, i])
+    }
+  }
+  
+  # Create gene parameter data frame
+  gene_params <- data.frame(
+    gene = genes,
     alpha = alpha,
     beta = beta,
     gamma = gamma,
     t_ = t_,
     scaling = scaling,
+    std_u = std_u,
+    std_s = std_s,
     likelihood = likelihood,
-    tau = tau_full
+    variance = variance,
+    alignment_scaling = alignment_scaling,
+    stringsAsFactors = FALSE
   )
-}
-
-#' Recover Latent Time
-#'
-#' @description Compute latent time for each cell based on fitted dynamics.
-#'
-#' @param seurat_obj A Seurat object with recovered dynamics
-#' @param vkey Velocity key
-#' @param min_likelihood Minimum likelihood threshold
-#' @param use_top_genes Number of top genes to use for time computation
-#'
-#' @return Modified Seurat object with latent_time in metadata
-#'
-#' @export
-recover_latent_time <- function(seurat_obj,
-                                  vkey = "velocity",
-                                  min_likelihood = 0.1,
-                                  use_top_genes = 100) {
+  rownames(gene_params) <- genes
   
-  .vmessage("Recovering latent time")
-  
-  if (is.null(seurat_obj@misc$dynamics_recovered)) {
-    stop("Dynamics not recovered. Run recover_dynamics first.", call. = FALSE)
+  # Store results
+  if (is.null(object@misc$scVeloR)) {
+    object@misc$scVeloR <- list()
   }
   
-  # Get stored latent times per gene
-  latent_time <- seurat_obj@misc$latent_time
-  
-  if (is.null(latent_time)) {
-    stop("Latent time matrix not found", call. = FALSE)
-  }
-  
-  # Get fit parameters
-  fit_params <- get_fit_params(seurat_obj)
-  
-  # Select genes based on likelihood
-  if ("fit_likelihood" %in% colnames(fit_params)) {
-    likelihood <- fit_params$fit_likelihood
-    good_genes <- !is.na(likelihood) & (likelihood >= min_likelihood)
-  } else {
-    good_genes <- !is.na(fit_params$fit_alpha)
-  }
-  
-  good_gene_names <- rownames(fit_params)[good_genes]
-  good_gene_names <- intersect(good_gene_names, rownames(latent_time))
-  
-  # Limit to top genes
-  if (length(good_gene_names) > use_top_genes) {
-    gene_scores <- fit_params[good_gene_names, "fit_likelihood"]
-    top_idx <- order(gene_scores, decreasing = TRUE)[seq_len(use_top_genes)]
-    good_gene_names <- good_gene_names[top_idx]
-  }
-  
-  .vmessage("Using ", length(good_gene_names), " genes for latent time")
-  
-  # Compute consensus latent time
-  latent_time_subset <- latent_time[good_gene_names, , drop = FALSE]
-  
-  # Median across genes (robust to outliers)
-  cell_time <- apply(latent_time_subset, 2, function(x) {
-    x <- x[!is.na(x)]
-    if (length(x) == 0) return(NA_real_)
-    stats::median(x)
-  })
-  
-  # Scale to [0, 1]
-  cell_time <- (cell_time - min(cell_time, na.rm = TRUE)) / 
-               (max(cell_time, na.rm = TRUE) - min(cell_time, na.rm = TRUE))
-  
-  # Store
-  seurat_obj@meta.data$latent_time <- cell_time
-  
-  .vmessage("Added latent_time to metadata")
-  
-  return(seurat_obj)
-}
-
-#' Differential Kinetic Test
-#'
-#' @description Test for differential kinetics between cell groups.
-#'
-#' @param seurat_obj A Seurat object with recovered dynamics
-#' @param groupby Column name for grouping
-#' @param groups Groups to compare (default: all pairs)
-#' @param n_jobs Number of parallel jobs
-#'
-#' @return Data frame with differential kinetics results
-#'
-#' @export
-differential_kinetic_test <- function(seurat_obj,
-                                        groupby,
-                                        groups = NULL,
-                                        n_jobs = 1L) {
-  
-  .vmessage("Testing differential kinetics")
-  
-  if (!groupby %in% colnames(seurat_obj@meta.data)) {
-    stop("Column '", groupby, "' not found in metadata", call. = FALSE)
-  }
-  
-  # Get groups
-  cell_groups <- seurat_obj@meta.data[[groupby]]
-  unique_groups <- unique(cell_groups)
-  
-  if (!is.null(groups)) {
-    groups <- intersect(groups, unique_groups)
-  } else {
-    groups <- unique_groups
-  }
-  
-  if (length(groups) < 2) {
-    stop("Need at least 2 groups for comparison", call. = FALSE)
-  }
-  
-  # Get parameters
-  fit_params <- get_fit_params(seurat_obj)
-  genes <- rownames(fit_params)
-  
-  # For each gene, test if gamma differs between groups
-  results <- data.frame(
-    gene = genes,
-    pvalue = NA_real_,
-    log2fc = NA_real_,
-    group1_gamma = NA_real_,
-    group2_gamma = NA_real_
+  object@misc$scVeloR$dynamics <- list(
+    gene_params = gene_params,
+    fit_t = T_matrix,
+    fit_tau = Tau_matrix,
+    fit_o = O_matrix,
+    genes = genes,
+    gene_indices = gene_indices,
+    t_max = t_max
   )
   
-  # Get moments
-  Ms <- make_dense(.get_layer_data(seurat_obj, "Ms"))
-  Mu <- make_dense(.get_layer_data(seurat_obj, "Mu"))
+  if (verbose) {
+    message("Done. Results stored in object@misc$scVeloR$dynamics")
+  }
   
-  for (i in seq_along(genes)) {
-    gene <- genes[i]
-    s <- Ms[gene, ]
-    u <- Mu[gene, ]
-    
-    # Fit gamma per group
-    gammas <- numeric(length(groups))
-    names(gammas) <- groups
-    
-    for (g in seq_along(groups)) {
-      mask <- cell_groups == groups[g]
-      sg <- s[mask]
-      ug <- u[mask]
+  object
+}
+
+#' Single Gene Dynamics Recovery
+#'
+#' @description Fit dynamics model for a single gene using EM algorithm.
+#'
+#' @param u Unspliced values
+#' @param s Spliced values
+#' @param gene Gene name
+#' @param max_iter Maximum iterations
+#' @param fit_scaling Whether to fit scaling
+#' @param fit_time Whether to fit time
+#' @param conn Connectivity matrix
+#' @param perc Percentile for weight initialization
+#'
+#' @return List with fitted parameters
+#' @keywords internal
+dynamics_recovery <- function(u, s, gene = NULL,
+                              max_iter = 10,
+                              fit_scaling = TRUE,
+                              fit_time = TRUE,
+                              conn = NULL,
+                              perc = 99) {
+  
+  # Initialize output structure
+  result <- list(
+    gene = gene,
+    recoverable = FALSE,
+    alpha = NA, beta = NA, gamma = NA,
+    t_ = NA, scaling = NA,
+    std_u = NA, std_s = NA,
+    likelihood = NA, variance = NA,
+    t = NA, tau = NA, o = NA
+  )
+  
+  # Convert to vectors
+  u <- as.vector(u)
+  s <- as.vector(s)
+  n <- length(u)
+  
+  # Initialize weights (filter extreme values and zeros)
+  nonzero <- (s > 0) & (u > 0)
+  
+  if (sum(nonzero) < 10) {
+    return(result)
+  }
+  
+  weights <- nonzero
+  
+  # Apply percentile filter
+  ub_s <- quantile(s[nonzero], perc / 100, na.rm = TRUE)
+  ub_u <- quantile(u[nonzero], perc / 100, na.rm = TRUE)
+  
+  if (ub_s > 0) weights <- weights & (s <= ub_s)
+  if (ub_u > 0) weights <- weights & (u <= ub_u)
+  
+  if (sum(weights) < 10) {
+    return(result)
+  }
+  
+  u_w <- u[weights]
+  s_w <- s[weights]
+  
+  # Initialize std
+  std_u <- sd(u_w)
+  std_s <- sd(s_w)
+  
+  if (std_u == 0 || std_s == 0 || !is.finite(std_u) || !is.finite(std_s)) {
+    return(result)
+  }
+  
+  # Initialize scaling
+  if (isTRUE(fit_scaling)) {
+    scaling <- std_u / std_s
+  } else if (is.numeric(fit_scaling)) {
+    scaling <- fit_scaling
+  } else {
+    scaling <- 1
+  }
+  
+  # Scale u
+  u_scaled <- u / scaling
+  u_w_scaled <- u_w / scaling
+  
+  # Initialize beta and gamma from extreme quantiles
+  perc_high <- 98
+  weights_s <- s_w >= quantile(s_w, perc_high / 100)
+  weights_u <- u_w_scaled >= quantile(u_w_scaled, perc_high / 100)
+  
+  # Initialize gamma from steady-state regression
+  beta <- 1
+  
+  # Linear regression: gamma = u_w / s_w at steady state
+  ss_mask <- weights_s
+  if (sum(ss_mask) < 3) ss_mask <- rep(TRUE, length(u_w_scaled))
+  
+  u_ss <- mean(u_w_scaled[ss_mask])
+  s_ss <- mean(s_w[ss_mask])
+  
+  gamma <- u_ss / s_ss
+  if (!is.finite(gamma) || gamma <= 0) gamma <- 1
+  
+  # Clip gamma to reasonable range
+  if (gamma < 0.05 / scaling) gamma <- gamma * 1.2
+  if (gamma > 1.5 / scaling) gamma <- gamma / 1.2
+  
+  # Initialize alpha and switching time
+  u_inf <- mean(u_w_scaled[weights_u | weights_s])
+  s_inf <- mean(s_w[weights_s])
+  
+  alpha <- u_inf * beta
+  
+  # Initial estimate of switching time
+  t_ <- tau_inv_u(u_inf, 0, alpha, beta)
+  if (!is.finite(t_) || t_ <= 0) t_ <- 1
+  
+  # Compute initial state at switching
+  result_switch <- mRNA(t_, 0, 0, alpha, beta, gamma)
+  u0_ <- result_switch$u
+  s0_ <- result_switch$s
+  
+  # Get initial time assignment
+  assignment <- assign_timepoints(
+    u_scaled, s, alpha, beta, gamma, t_, u0_, s0_,
+    mode = if (beta < gamma) "projection" else "inverse"
+  )
+  
+  t <- assignment$tau * assignment$o + (assignment$tau_ + t_) * (1 - assignment$o)
+  tau <- assignment$tau
+  o <- assignment$o
+  
+  # Calculate initial loss
+  loss <- compute_loss(u_scaled, s, t, t_, alpha, beta, gamma, std_u / scaling, std_s)
+  
+  result$recoverable <- TRUE
+  
+  if (max_iter > 0) {
+    # EM optimization
+    for (iter in seq_len(max_iter)) {
+      # Store previous values
+      alpha_old <- alpha
+      beta_old <- beta
+      gamma_old <- gamma
+      t__old <- t_
+      loss_old <- loss
       
-      ss <- sum(sg^2)
-      if (ss > 0) {
-        gammas[g] <- sum(sg * ug) / ss
+      # Optimize t_ and alpha
+      opt_result <- optim(
+        par = c(t_, alpha),
+        fn = function(x) {
+          compute_loss(u_scaled, s, t, x[1], x[2], beta, gamma, 
+                      std_u / scaling, std_s, refit_time = TRUE)
+        },
+        method = "Nelder-Mead",
+        control = list(maxit = max_iter %/% 5)
+      )
+      
+      if (opt_result$value < loss) {
+        t_ <- opt_result$par[1]
+        alpha <- opt_result$par[2]
+        loss <- opt_result$value
       }
-    }
-    
-    # Simple t-test (comparing gamma estimates would require bootstrap)
-    # Here we compare expression-velocity relationship
-    if (length(groups) == 2) {
-      mask1 <- cell_groups == groups[1]
-      mask2 <- cell_groups == groups[2]
       
-      # Velocity correlation as measure
-      v1 <- u[mask1] - gammas[1] * s[mask1]
-      v2 <- u[mask2] - gammas[2] * s[mask2]
-      
-      # Test difference in velocity
-      if (length(v1) > 5 && length(v2) > 5) {
-        test <- tryCatch({
-          stats::t.test(v1, v2)
-        }, error = function(e) NULL)
+      # Optimize scaling if requested
+      if (isTRUE(fit_scaling)) {
+        opt_result <- optim(
+          par = c(t_, beta, scaling),
+          fn = function(x) {
+            compute_loss(u / x[3], s, t, x[1], alpha, x[2], gamma,
+                        std_u / x[3], std_s, refit_time = TRUE)
+          },
+          method = "Nelder-Mead",
+          control = list(maxit = max_iter %/% 5)
+        )
         
-        if (!is.null(test)) {
-          results$pvalue[i] <- test$p.value
+        if (opt_result$value < loss) {
+          t_ <- opt_result$par[1]
+          beta <- opt_result$par[2]
+          scaling <- opt_result$par[3]
+          u_scaled <- u / scaling
+          loss <- opt_result$value
         }
       }
       
-      results$group1_gamma[i] <- gammas[1]
-      results$group2_gamma[i] <- gammas[2]
+      # Optimize rates
+      opt_result <- optim(
+        par = c(alpha, gamma),
+        fn = function(x) {
+          compute_loss(u_scaled, s, t, t_, x[1], beta, x[2],
+                      std_u / scaling, std_s, refit_time = TRUE)
+        },
+        method = "Nelder-Mead",
+        control = list(maxit = max_iter %/% 5)
+      )
       
-      if (gammas[1] > 0 && gammas[2] > 0) {
-        results$log2fc[i] <- log2(gammas[2] / gammas[1])
+      if (opt_result$value < loss) {
+        alpha <- opt_result$par[1]
+        gamma <- opt_result$par[2]
+        loss <- opt_result$value
+      }
+      
+      # Optimize t_
+      opt_result <- optim(
+        par = t_,
+        fn = function(x) {
+          compute_loss(u_scaled, s, t, x[1], alpha, beta, gamma,
+                      std_u / scaling, std_s, refit_time = TRUE)
+        },
+        method = "Nelder-Mead",
+        control = list(maxit = max_iter %/% 5)
+      )
+      
+      if (opt_result$value < loss) {
+        t_ <- opt_result$par[1]
+        loss <- opt_result$value
+      }
+      
+      # Optimize all rates together
+      opt_result <- optim(
+        par = c(t_, alpha, beta, gamma),
+        fn = function(x) {
+          compute_loss(u_scaled, s, t, x[1], x[2], x[3], x[4],
+                      std_u / scaling, std_s, refit_time = TRUE)
+        },
+        method = "Nelder-Mead",
+        control = list(maxit = max_iter %/% 5)
+      )
+      
+      if (opt_result$value < loss) {
+        t_ <- opt_result$par[1]
+        alpha <- opt_result$par[2]
+        beta <- opt_result$par[3]
+        gamma <- opt_result$par[4]
+        loss <- opt_result$value
+      }
+      
+      # Update time assignment
+      result_switch <- mRNA(t_, 0, 0, alpha, beta, gamma)
+      u0_ <- result_switch$u
+      s0_ <- result_switch$s
+      
+      assignment <- assign_timepoints(
+        u_scaled, s, alpha, beta, gamma, t_, u0_, s0_,
+        mode = if (beta < gamma) "projection" else "inverse"
+      )
+      
+      t <- assignment$tau * assignment$o + (assignment$tau_ + t_) * (1 - assignment$o)
+      tau <- assignment$tau
+      o <- assignment$o
+      
+      # Check convergence
+      if (abs(loss_old - loss) < 1e-6 * loss_old) {
+        break
       }
     }
   }
   
-  # Adjust p-values
-  results$padj <- stats::p.adjust(results$pvalue, method = "BH")
+  # Final time assignment
+  result_switch <- mRNA(t_, 0, 0, alpha, beta, gamma)
+  u0_ <- result_switch$u
+  s0_ <- result_switch$s
   
-  # Sort by significance
-  results <- results[order(results$pvalue), ]
+  assignment <- assign_timepoints(
+    u_scaled, s, alpha, beta, gamma, t_, u0_, s0_,
+    mode = "projection"
+  )
   
-  return(results)
+  t <- assignment$tau * assignment$o + (assignment$tau_ + t_) * (1 - assignment$o)
+  tau <- assignment$tau
+  o <- assignment$o
+  
+  # Compute final likelihood
+  likelihood <- compute_likelihood(
+    u_scaled, s, t, t_, alpha, beta, gamma,
+    std_u / scaling, std_s
+  )
+  
+  # Compute variance
+  variance <- compute_variance(
+    u_scaled, s, t, t_, alpha, beta, gamma,
+    std_u / scaling, std_s
+  )
+  
+  # Return results
+  result$alpha <- alpha
+  result$beta <- beta
+  result$gamma <- gamma
+  result$t_ <- t_
+  result$scaling <- scaling
+  result$std_u <- std_u
+  result$std_s <- std_s
+  result$likelihood <- likelihood
+  result$variance <- variance
+  result$t <- t
+  result$tau <- tau
+  result$o <- o
+  
+  result
+}
+
+#' Compute Loss Function
+#'
+#' @description Compute sum of squared errors between observations and model.
+#'
+#' @param u Scaled unspliced
+#' @param s Spliced
+#' @param t Cell times
+#' @param t_ Switching time
+#' @param alpha Transcription rate
+#' @param beta Splicing rate
+#' @param gamma Degradation rate
+#' @param std_u Std of unspliced
+#' @param std_s Std of spliced
+#' @param refit_time Whether to refit time
+#'
+#' @return Loss value
+#' @keywords internal
+compute_loss <- function(u, s, t, t_, alpha, beta, gamma,
+                         std_u, std_s, refit_time = FALSE) {
+  
+  # Ensure positive parameters
+  if (alpha <= 0 || beta <= 0 || gamma <= 0 || t_ <= 0) {
+    return(Inf)
+  }
+  
+  if (refit_time) {
+    # Recompute time assignment
+    result_switch <- mRNA(t_, 0, 0, alpha, beta, gamma)
+    u0_ <- result_switch$u
+    s0_ <- result_switch$s
+    
+    assignment <- assign_timepoints(
+      u, s, alpha, beta, gamma, t_, u0_, s0_,
+      mode = "inverse"
+    )
+    
+    t <- assignment$tau * assignment$o + (assignment$tau_ + t_) * (1 - assignment$o)
+  }
+  
+  # Vectorize parameters
+  params <- vectorize_params(t, t_, alpha, beta, gamma)
+  
+  # Compute model predictions
+  result <- mRNA(params$tau, params$u0, params$s0, params$alpha, beta, gamma)
+  ut <- result$u
+  st <- result$s
+  
+  # Compute normalized residuals
+  u_diff <- (u - ut) / std_u
+  s_diff <- (s - st) / std_s
+  
+  # Sum of squared errors
+  sum(u_diff^2 + s_diff^2, na.rm = TRUE)
+}
+
+#' Compute Likelihood
+#'
+#' @description Compute model likelihood.
+#'
+#' @param u Scaled unspliced
+#' @param s Spliced
+#' @param t Cell times
+#' @param t_ Switching time
+#' @param alpha Transcription rate
+#' @param beta Splicing rate
+#' @param gamma Degradation rate
+#' @param std_u Std of unspliced
+#' @param std_s Std of spliced
+#'
+#' @return Likelihood value
+#' @keywords internal
+compute_likelihood <- function(u, s, t, t_, alpha, beta, gamma,
+                                std_u, std_s) {
+  
+  # Vectorize parameters
+  params <- vectorize_params(t, t_, alpha, beta, gamma)
+  
+  # Compute model predictions
+  result <- mRNA(params$tau, params$u0, params$s0, params$alpha, beta, gamma)
+  ut <- result$u
+  st <- result$s
+  
+  # Compute normalized residuals
+  u_diff <- (u - ut) / std_u
+  s_diff <- (s - st) / std_s
+  
+  distx <- u_diff^2 + s_diff^2
+  
+  # Compute variance
+  n <- sum(!is.na(distx))
+  n <- max(n - n * 0.01, 2)
+  
+  varx <- mean(distx, na.rm = TRUE) - mean(sign(s_diff) * sqrt(distx), na.rm = TRUE)^2
+  varx <- max(varx, 1e-10)
+  
+  # Log likelihood
+  log_lik <- -1 / 2 / n * sum(distx, na.rm = TRUE) / varx - 1 / 2 * log(2 * pi * varx)
+  
+  exp(log_lik)
+}
+
+#' Compute Variance
+#'
+#' @description Compute model variance for goodness-of-fit.
+#'
+#' @param u Scaled unspliced
+#' @param s Spliced
+#' @param t Cell times
+#' @param t_ Switching time
+#' @param alpha Transcription rate
+#' @param beta Splicing rate
+#' @param gamma Degradation rate
+#' @param std_u Std of unspliced
+#' @param std_s Std of spliced
+#'
+#' @return Variance value
+#' @keywords internal
+compute_variance <- function(u, s, t, t_, alpha, beta, gamma,
+                              std_u, std_s) {
+  
+  # Vectorize parameters
+  params <- vectorize_params(t, t_, alpha, beta, gamma)
+  
+  # Compute model predictions
+  result <- mRNA(params$tau, params$u0, params$s0, params$alpha, beta, gamma)
+  ut <- result$u
+  st <- result$s
+  
+  # Compute normalized residuals
+  u_diff <- (u - ut) / std_u
+  s_diff <- (s - st) / std_s
+  
+  distx <- u_diff^2 + s_diff^2
+  
+  mean(distx, na.rm = TRUE) - mean(sign(s_diff) * sqrt(distx), na.rm = TRUE)^2
+}
+
+#' Align Dynamics
+#'
+#' @description Align gene-specific dynamics to a common time scale.
+#'
+#' @param T_matrix Matrix of cell times (cells x genes)
+#' @param t_ Vector of switching times
+#' @param alpha Vector of transcription rates
+#' @param beta Vector of splicing rates
+#' @param gamma Vector of degradation rates
+#' @param scaling Vector of scaling factors
+#' @param t_max Target maximum time
+#'
+#' @return List with aligned parameters
+#' @keywords internal
+align_dynamics <- function(T_matrix, t_, alpha, beta, gamma, scaling,
+                           t_max = 20) {
+  
+  n_genes <- ncol(T_matrix)
+  
+  # Compute maximum time for each gene
+  T_max <- numeric(n_genes)
+  
+  for (i in seq_len(n_genes)) {
+    if (is.na(t_[i])) next
+    
+    t_col <- T_matrix[, i]
+    valid <- !is.na(t_col)
+    
+    # Time in "on" phase (before switching)
+    on_mask <- t_col < t_[i]
+    T_on <- if (any(on_mask & valid)) max(t_col[on_mask & valid]) else 0
+    
+    # Time in "off" phase (after switching)
+    off_mask <- t_col >= t_[i]
+    T_off <- if (any(off_mask & valid)) max(t_col[off_mask & valid] - t_[i]) else 0
+    
+    T_max[i] <- T_on + T_off
+    
+    # Adjust for steady state cells
+    n_steady <- sum(t_col == t_[i] | t_col == 0, na.rm = TRUE)
+    if (n_steady > 0 && T_max[i] > 0) {
+      T_max[i] <- T_max[i] / (1 - n_steady / sum(valid))
+    }
+  }
+  
+  T_max[T_max == 0 | !is.finite(T_max)] <- 1
+  
+  # Compute alignment scaling
+  m <- t_max / T_max
+  m[!is.finite(m)] <- 1
+  
+  # Apply scaling
+  for (i in seq_len(n_genes)) {
+    if (is.na(t_[i]) || m[i] == 1) next
+    
+    T_matrix[, i] <- T_matrix[, i] * m[i]
+    t_[i] <- t_[i] * m[i]
+    alpha[i] <- alpha[i] / m[i]
+    beta[i] <- beta[i] / m[i]
+    gamma[i] <- gamma[i] / m[i]
+  }
+  
+  alignment_scaling <- m
+  alignment_scaling[alignment_scaling == 1] <- NA
+  
+  list(
+    T = T_matrix,
+    t_ = t_,
+    alpha = alpha,
+    beta = beta,
+    gamma = gamma,
+    alignment_scaling = alignment_scaling
+  )
+}
+
+#' Compute Dynamical Velocity
+#'
+#' @description Compute velocity using parameters from the dynamical model.
+#'
+#' @param object Seurat object with dynamics fitted
+#' @param mode Velocity mode: "soft", "hard", or "deterministic"
+#'
+#' @return Seurat object with velocity_s in misc$scVeloR$velocity
+#' @export
+velocity_from_dynamics <- function(object, mode = "deterministic") {
+  
+  if (is.null(object@misc$scVeloR$dynamics)) {
+    stop("Run recover_dynamics() first")
+  }
+  
+  dynamics <- object@misc$scVeloR$dynamics
+  gene_params <- dynamics$gene_params
+  fit_t <- dynamics$fit_t
+  genes <- dynamics$genes
+  gene_indices <- dynamics$gene_indices
+  
+  # Get data
+  data <- get_velocity_data(object)
+  Ms <- data$Ms
+  Mu <- data$Mu
+  
+  n_cells <- nrow(Ms)
+  n_genes <- length(genes)
+  
+  # Initialize velocity matrix
+  velocity_s <- matrix(0, n_cells, ncol(Ms))
+  colnames(velocity_s) <- colnames(Ms)
+  
+  for (i in seq_len(n_genes)) {
+    idx <- gene_indices[i]
+    
+    alpha <- gene_params$alpha[i]
+    beta <- gene_params$beta[i] * gene_params$scaling[i]  # Scale back
+    gamma <- gene_params$gamma[i]
+    t_ <- gene_params$t_[i]
+    scaling <- gene_params$scaling[i]
+    
+    if (is.na(alpha)) next
+    
+    t <- fit_t[, i]
+    u <- Mu[, idx] / scaling
+    s <- Ms[, idx]
+    
+    # Vectorize based on time
+    params <- vectorize_params(t, t_, alpha, beta, gamma)
+    
+    # Compute model predictions
+    result <- mRNA(params$tau, params$u0, params$s0, params$alpha, beta, gamma)
+    ut <- result$u
+    st <- result$s
+    
+    # Compute velocity: ds/dt = beta*u - gamma*s
+    v_s <- ut * beta - st * gamma
+    
+    # Clip velocity
+    v_s <- pmax(v_s, -s)
+    
+    velocity_s[, idx] <- v_s
+  }
+  
+  # Store results
+  if (is.null(object@misc$scVeloR$velocity)) {
+    object@misc$scVeloR$velocity <- list()
+  }
+  
+  object@misc$scVeloR$velocity$velocity_s <- velocity_s
+  object@misc$scVeloR$velocity$velocity_genes <- gene_indices
+  object@misc$scVeloR$velocity$mode <- "dynamical"
+  
+  object
 }

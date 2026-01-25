@@ -1,20 +1,24 @@
 Package: scVeloR
 Type: Package
-Title: RNA Velocity Analysis for Single-Cell RNA-Seq Data
-Version: 1.0.0
-Date: 2026-01-25
+Title: RNA Velocity Analysis in R
+Version: 0.1.0
 Authors@R: c(
     person("Zaoqu", "Liu", 
            email = "liuzaoqu@163.com", 
            role = c("aut", "cre"),
-           comment = c(ORCID = "0000-0002-0000-0000")))
-Description: A comprehensive R implementation of RNA velocity analysis for 
-    single-cell RNA sequencing data. This package provides methods for 
-    estimating RNA velocities using steady-state, stochastic, and dynamical 
-    models. It includes functions for velocity graph construction, embedding 
-    projection, transition matrix computation, and various visualization tools.
-    The package is optimized for performance using Rcpp and supports parallel 
-    computation via the future framework. Compatible with Seurat V4 and V5 objects.
+           comment = c(ORCID = "0000-0002-1234-5678")),
+    person("scVelo Team", 
+           role = "ctb",
+           comment = "Original Python implementation")
+    )
+Description: A comprehensive R implementation of RNA velocity analysis based on 
+    the scvelo Python package. This package enables estimation of RNA velocities 
+    for single-cell RNA-seq data, supporting deterministic (steady-state), 
+    stochastic, and dynamical models. The dynamical model uses an 
+    Expectation-Maximization algorithm to infer full transcriptional kinetics 
+    including transcription, splicing, and degradation rates. The package 
+    integrates seamlessly with Seurat objects and provides visualization 
+    functions for velocity embedding, stream plots, and phase portraits.
 License: MIT + file LICENSE
 URL: https://github.com/Zaoqu-Liu/scVeloR
 BugReports: https://github.com/Zaoqu-Liu/scVeloR/issues
@@ -25,32 +29,27 @@ RoxygenNote: 7.3.0
 Depends:
     R (>= 4.0.0)
 Imports:
-    Seurat (>= 4.0.0),
-    SeuratObject (>= 4.0.0),
-    Matrix (>= 1.5.0),
+    Matrix,
     Rcpp (>= 1.0.0),
-    ggplot2 (>= 3.4.0),
-    future,
-    future.apply,
-    progressr,
-    FNN,
-    uwot,
-    irlba,
-    scales,
-    grDevices,
-    stats,
+    RcppArmadillo,
     methods,
-    utils
-LinkingTo:
-    Rcpp,
-    RcppArmadillo
+    stats,
+    utils,
+    grDevices
 Suggests:
+    Seurat (>= 4.0.0),
+    SeuratObject,
+    ggplot2 (>= 3.0.0),
+    viridis,
+    RSpectra,
     testthat (>= 3.0.0),
     knitr,
     rmarkdown,
-    covr,
-    BiocStyle
+    RcppAnnoy,
+    RcppHNSW,
+    parallel
+LinkingTo:
+    Rcpp,
+    RcppArmadillo
 VignetteBuilder: knitr
 Config/testthat/edition: 3
-NeedsCompilation: yes
-SystemRequirements: C++11

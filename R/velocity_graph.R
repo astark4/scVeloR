@@ -1,228 +1,452 @@
-#' @title Velocity Graph Computation
-#' @description Functions for constructing the velocity graph based on cosine similarity.
+#' @title Velocity Graph Construction
+#' @description Build velocity graph and transition probability matrices.
+#' The velocity graph represents the predicted direction of each cell based on
+#' its RNA velocity vector.
 #' @name velocity_graph
 NULL
 
-#' Compute Velocity Graph
+#' Build Velocity Graph
 #'
-#' @description Compute the velocity graph, which represents the transition 
-#' probabilities between cells based on velocity vectors.
+#' @description Construct velocity graph using cosine similarity between 
+#' velocity vectors and cell-cell displacement vectors.
 #'
-#' @param seurat_obj A Seurat object with computed velocity
-#' @param vkey Key for velocity layer (default: "velocity")
-#' @param xkey Key for expression layer (default: "Ms")
-#' @param n_neighbors Number of neighbors (default: NULL uses stored value)
-#' @param n_recurse_neighbors Recursion depth for neighbor expansion (default: 0)
-#' @param sqrt_transform Apply sqrt transform to velocities (default: TRUE)
-#' @param gene_subset Genes to use (default: NULL uses velocity genes)
-#' @param n_jobs Number of parallel jobs (default: 1)
+#' @param object Seurat object with velocity computed
+#' @param n_neighbors Number of neighbors for graph construction
+#' @param n_recurse_neighbors Number of times to recurse neighbors
+#' @param mode Graph computation mode: "deterministic", "stochastic", or "dynamical"
+#' @param approx Use approximate computation
+#' @param sqrt_transform Square root transform of graph weights
+#' @param n_cores Number of cores for parallel computation
+#' @param verbose Print progress
 #'
-#' @return Modified Seurat object with velocity_graph in misc
-#'
+#' @return Seurat object with velocity_graph in misc$scVeloR$velocity_graph
 #' @export
-compute_velocity_graph <- function(seurat_obj,
-                                    vkey = "velocity",
-                                    xkey = "Ms",
-                                    n_neighbors = NULL,
-                                    n_recurse_neighbors = 0L,
-                                    sqrt_transform = TRUE,
-                                    gene_subset = NULL,
-                                    n_jobs = 1L) {
+velocity_graph <- function(object,
+                           n_neighbors = 30,
+                           n_recurse_neighbors = 2,
+                           mode = NULL,
+                           approx = TRUE,
+                           sqrt_transform = TRUE,
+                           n_cores = 1,
+                           verbose = TRUE) {
   
-  .vmessage("Computing velocity graph")
-  
-  # Validate
-  validate_seurat(seurat_obj, require_velocity = TRUE)
-  
-  # Get velocity and expression
-  V <- .get_layer_data(seurat_obj, vkey)
-  X <- .get_layer_data(seurat_obj, xkey)
-  
-  # Ensure same dimensions
-  common_genes <- intersect(rownames(V), rownames(X))
-  V <- V[common_genes, , drop = FALSE]
-  X <- X[common_genes, , drop = FALSE]
-  
-  # Subset genes if specified
-  if (!is.null(gene_subset)) {
-    gene_subset <- intersect(gene_subset, common_genes)
-    V <- V[gene_subset, , drop = FALSE]
-    X <- X[gene_subset, , drop = FALSE]
+  if (is.null(object@misc$scVeloR$velocity$velocity_s)) {
+    stop("Run velocity() first")
   }
   
-  # Remove NA genes
-  na_mask <- Matrix::rowSums(is.na(V)) < ncol(V)
-  V <- V[na_mask, , drop = FALSE]
-  X <- X[na_mask, , drop = FALSE]
+  if (verbose) {
+    message("Building velocity graph...")
+  }
   
-  .vmessage("Using ", nrow(V), " genes for velocity graph")
+  # Get velocity matrix
+  velocity <- object@misc$scVeloR$velocity$velocity_s
+  velocity_genes <- object@misc$scVeloR$velocity$velocity_genes
   
-  # Convert to dense and transpose (cells x genes)
-  V_t <- t(make_dense(V))
-  X_t <- t(make_dense(X))
+  # Get spliced data
+  data <- get_velocity_data(object)
+  Ms <- data$Ms
   
-  n_cells <- nrow(V_t)
-  n_genes <- ncol(V_t)
+  # Use velocity genes only
+  velocity <- velocity[, velocity_genes, drop = FALSE]
+  Ms <- Ms[, velocity_genes, drop = FALSE]
   
-  # Get neighbor information
-  if (is.null(n_neighbors)) {
-    n_neighbors <- get_n_neighbors(seurat_obj)
-    if (n_neighbors == 0) {
-      n_neighbors <- min(30, n_cells - 1)
+  n_cells <- nrow(Ms)
+  
+  # Get or compute neighbor graph
+  if (!is.null(object@misc$scVeloR$neighbors)) {
+    indices <- object@misc$scVeloR$neighbors$indices
+    distances <- object@misc$scVeloR$neighbors$distances
+    connectivities <- object@misc$scVeloR$neighbors$connectivities
+    
+    if (ncol(indices) < n_neighbors) {
+      message("  Recomputing neighbors with more neighbors...")
+      object <- compute_neighbors(object, n_neighbors = n_neighbors, verbose = FALSE)
+      indices <- object@misc$scVeloR$neighbors$indices
+      distances <- object@misc$scVeloR$neighbors$distances
+      connectivities <- object@misc$scVeloR$neighbors$connectivities
+    }
+  } else {
+    object <- compute_neighbors(object, n_neighbors = n_neighbors, verbose = FALSE)
+    indices <- object@misc$scVeloR$neighbors$indices
+    distances <- object@misc$scVeloR$neighbors$distances
+    connectivities <- object@misc$scVeloR$neighbors$connectivities
+  }
+  
+  # Extend neighbors by recursion
+  if (n_recurse_neighbors > 0) {
+    indices_ext <- recurse_neighbors(indices, n_recurse = n_recurse_neighbors)
+  } else {
+    indices_ext <- indices
+  }
+  
+  # Compute cosine correlation between velocity and displacement
+  if (verbose) {
+    message("  Computing velocity correlations...")
+  }
+  
+  # Use C++ implementation if available
+  if (requireNamespace("Rcpp", quietly = TRUE)) {
+    graph <- compute_cosine_correlation_graph(
+      velocity = as.matrix(velocity),
+      expression = as.matrix(Ms),
+      indices = indices_ext,
+      n_cores = n_cores
+    )
+  } else {
+    graph <- compute_velocity_graph_r(
+      velocity = velocity,
+      expression = Ms,
+      indices = indices_ext
+    )
+  }
+  
+  # Apply transformations
+  if (sqrt_transform) {
+    graph@x <- sqrt(abs(graph@x)) * sign(graph@x)
+  }
+  
+  # Build transition matrix
+  if (verbose) {
+    message("  Computing transition matrix...")
+  }
+  
+  transition_matrix <- compute_transition_matrix(
+    graph = graph,
+    self_transitions = TRUE,
+    scale_by_distance = TRUE,
+    distances = distances,
+    indices = indices
+  )
+  
+  # Store results
+  if (is.null(object@misc$scVeloR$velocity_graph)) {
+    object@misc$scVeloR$velocity_graph <- list()
+  }
+  
+  object@misc$scVeloR$velocity_graph$graph <- graph
+  object@misc$scVeloR$velocity_graph$transition_matrix <- transition_matrix
+  object@misc$scVeloR$velocity_graph$n_neighbors <- n_neighbors
+  
+  # Also store in velocity for convenience
+  object@misc$scVeloR$velocity$transition_matrix <- transition_matrix
+  
+  if (verbose) {
+    message("Done. Velocity graph stored in object@misc$scVeloR$velocity_graph")
+  }
+  
+  object
+}
+
+#' Compute Velocity Graph in R
+#'
+#' @description Pure R implementation of velocity graph computation.
+#'
+#' @param velocity Velocity matrix
+#' @param expression Expression matrix
+#' @param indices Neighbor indices matrix
+#'
+#' @return Sparse graph matrix
+#' @keywords internal
+compute_velocity_graph_r <- function(velocity, expression, indices) {
+  
+  n_cells <- nrow(velocity)
+  n_neighbors <- ncol(indices)
+  
+  # Initialize sparse matrix components
+  i_idx <- integer(0)
+  j_idx <- integer(0)
+  x_val <- numeric(0)
+  
+  for (cell in seq_len(n_cells)) {
+    # Get velocity vector for this cell
+    v <- velocity[cell, ]
+    v_norm <- sqrt(sum(v^2))
+    
+    if (v_norm == 0 || !is.finite(v_norm)) next
+    
+    # Get neighbors
+    neighbors <- indices[cell, ]
+    neighbors <- neighbors[neighbors > 0 & neighbors <= n_cells]
+    
+    if (length(neighbors) == 0) next
+    
+    for (j in neighbors) {
+      # Displacement from cell to neighbor
+      dx <- expression[j, ] - expression[cell, ]
+      dx_norm <- sqrt(sum(dx^2))
+      
+      if (dx_norm == 0 || !is.finite(dx_norm)) next
+      
+      # Cosine similarity
+      cos_sim <- sum(v * dx) / (v_norm * dx_norm)
+      
+      # Store positive correlations
+      if (cos_sim > 0) {
+        i_idx <- c(i_idx, cell)
+        j_idx <- c(j_idx, j)
+        x_val <- c(x_val, cos_sim)
+      }
     }
   }
   
-  # Get neighbor indices
-  neighbor_indices <- get_neighbor_indices(seurat_obj)
-  
-  # Expand neighbors if requested
-  if (n_recurse_neighbors > 0) {
-    indices_list <- lapply(seq_len(n_cells), function(i) {
-      get_iterative_neighbors(seurat_obj, i, n_recurse = n_recurse_neighbors + 1)
-    })
-  } else {
-    # Convert matrix to list of 0-based indices
-    indices_list <- lapply(seq_len(n_cells), function(i) {
-      as.integer(neighbor_indices[i, ] - 1L)
-    })
-  }
-  
-  # Compute velocity graph using C++
-  .vmessage("Computing cosine correlations...")
-  
-  result <- compute_velocity_graph_batch_cpp(
-    X_t, V_t, indices_list, sqrt_transform
-  )
-  
   # Create sparse matrix
-  vals <- result$vals
-  rows <- result$rows + 1L  # Convert to 1-based
-  cols <- result$cols + 1L
-  
-  # Split into positive and negative
-  pos_mask <- vals > 0
-  neg_mask <- vals < 0
-  
-  # Positive graph
-  if (sum(pos_mask) > 0) {
-    graph_pos <- Matrix::sparseMatrix(
-      i = rows[pos_mask],
-      j = cols[pos_mask],
-      x = vals[pos_mask],
-      dims = c(n_cells, n_cells)
-    )
-  } else {
-    graph_pos <- Matrix::sparseMatrix(i = integer(0), j = integer(0), 
-                                      x = numeric(0), dims = c(n_cells, n_cells))
-  }
-  
-  # Negative graph
-  if (sum(neg_mask) > 0) {
-    graph_neg <- Matrix::sparseMatrix(
-      i = rows[neg_mask],
-      j = cols[neg_mask],
-      x = -vals[neg_mask],  # Store absolute values
-      dims = c(n_cells, n_cells)
-    )
-  } else {
-    graph_neg <- Matrix::sparseMatrix(i = integer(0), j = integer(0), 
-                                      x = numeric(0), dims = c(n_cells, n_cells))
-  }
-  
-  # Set names
-  cell_names <- colnames(seurat_obj)
-  rownames(graph_pos) <- cell_names
-  colnames(graph_pos) <- cell_names
-  rownames(graph_neg) <- cell_names
-  colnames(graph_neg) <- cell_names
-  
-  # Store in Seurat object
-  seurat_obj@misc$velocity_graph <- graph_pos
-  seurat_obj@misc$velocity_graph_neg <- graph_neg
-  
-  seurat_obj@misc$velocity_graph_params <- list(
-    n_neighbors = n_neighbors,
-    sqrt_transform = sqrt_transform,
-    n_genes = n_genes
+  sparseMatrix(
+    i = i_idx,
+    j = j_idx,
+    x = x_val,
+    dims = c(n_cells, n_cells)
   )
-  
-  .vmessage("Velocity graph computed with ", sum(graph_pos > 0), " positive edges")
-  
-  return(seurat_obj)
 }
 
-#' Get Velocity Graph
+#' Compute Cosine Correlation Graph Using C++
 #'
-#' @description Extract velocity graph from Seurat object.
+#' @description Compute velocity graph using optimized C++ code.
 #'
-#' @param seurat_obj A Seurat object
-#' @param negative Whether to return negative graph (default: FALSE)
+#' @param velocity Velocity matrix
+#' @param expression Expression matrix
+#' @param indices Neighbor indices matrix
+#' @param n_cores Number of cores
 #'
-#' @return Sparse velocity graph matrix
-#'
-#' @export
-get_velocity_graph <- function(seurat_obj, negative = FALSE) {
-  if (negative) {
-    graph <- seurat_obj@misc$velocity_graph_neg
+#' @return Sparse graph matrix
+#' @keywords internal
+compute_cosine_correlation_graph <- function(velocity, expression, indices, n_cores = 1) {
+  
+  n_cells <- nrow(velocity)
+  n_neighbors <- ncol(indices)
+  
+  # Check if our C++ function is available
+  if (exists("compute_cosine_similarity_cpp")) {
+    result <- compute_cosine_similarity_cpp(velocity, expression, indices)
+    
+    # Convert to sparse matrix
+    sparseMatrix(
+      i = result$i + 1L,  # C++ uses 0-based indexing
+      j = result$j + 1L,
+      x = result$x,
+      dims = c(n_cells, n_cells)
+    )
   } else {
-    graph <- seurat_obj@misc$velocity_graph
+    # Fall back to R implementation
+    compute_velocity_graph_r(velocity, expression, indices)
   }
-  
-  if (is.null(graph)) {
-    stop("Velocity graph not found. Run compute_velocity_graph first.", call. = FALSE)
-  }
-  
-  return(graph)
 }
 
-#' Cosine Similarity
+#' Recurse Neighbors
 #'
-#' @description Compute cosine similarity between two vectors.
+#' @description Extend neighbor graph by including neighbors of neighbors.
 #'
-#' @param a First vector
-#' @param b Second vector
-#' @return Cosine similarity value
+#' @param indices Original neighbor indices
+#' @param n_recurse Number of recursions
+#'
+#' @return Extended neighbor indices matrix
 #' @keywords internal
-cosine_similarity <- function(a, b) {
-  norm_a <- sqrt(sum(a^2))
-  norm_b <- sqrt(sum(b^2))
+recurse_neighbors <- function(indices, n_recurse = 1) {
   
-  if (norm_a < 1e-10 || norm_b < 1e-10) {
-    return(0)
+  if (n_recurse <= 0) return(indices)
+  
+  n_cells <- nrow(indices)
+  n_neighbors <- ncol(indices)
+  
+  # Convert to sets for easier manipulation
+  neighbor_sets <- lapply(seq_len(n_cells), function(i) {
+    unique(indices[i, ])
+  })
+  
+  for (r in seq_len(n_recurse)) {
+    new_neighbor_sets <- lapply(seq_len(n_cells), function(i) {
+      current <- neighbor_sets[[i]]
+      extended <- current
+      
+      for (j in current) {
+        if (j > 0 && j <= n_cells) {
+          extended <- union(extended, neighbor_sets[[j]])
+        }
+      }
+      
+      # Remove self
+      extended <- setdiff(extended, i)
+      extended
+    })
+    neighbor_sets <- new_neighbor_sets
   }
   
-  sum(a * b) / (norm_a * norm_b)
-}
-
-#' Compute Velocity Correlation
-#'
-#' @description Compute correlation between velocity and cell-cell expression differences.
-#'
-#' @param dX Matrix of expression differences (n_neighbors x n_genes)
-#' @param v Velocity vector (length n_genes)
-#' @return Vector of correlations
-#' @keywords internal
-velocity_correlation <- function(dX, v) {
-  # Use Rcpp function
-  cosine_correlation_cpp(dX, v)
-}
-
-#' Subset Velocity Graph
-#'
-#' @description Subset velocity graph to specific cells.
-#'
-#' @param seurat_obj A Seurat object
-#' @param cells Cell names or indices
-#' @param negative Whether to subset negative graph
-#' @return Subsetted sparse matrix
-#' @keywords internal
-subset_velocity_graph <- function(seurat_obj, cells, negative = FALSE) {
-  graph <- get_velocity_graph(seurat_obj, negative)
+  # Convert back to matrix format
+  max_neighbors <- max(sapply(neighbor_sets, length))
   
-  if (is.character(cells)) {
-    cells <- match(cells, rownames(graph))
-    cells <- cells[!is.na(cells)]
+  indices_ext <- matrix(0L, n_cells, max_neighbors)
+  
+  for (i in seq_len(n_cells)) {
+    neighbors <- neighbor_sets[[i]]
+    if (length(neighbors) > 0) {
+      indices_ext[i, seq_along(neighbors)] <- neighbors
+    }
   }
   
-  graph[cells, cells, drop = FALSE]
+  indices_ext
+}
+
+#' Compute Transition Matrix
+#'
+#' @description Compute transition probability matrix from velocity graph.
+#'
+#' @param graph Velocity graph (sparse matrix)
+#' @param self_transitions Include self-transitions
+#' @param scale_by_distance Scale by distance
+#' @param distances Distance matrix
+#' @param indices Neighbor indices
+#'
+#' @return Transition probability matrix
+#' @keywords internal
+compute_transition_matrix <- function(graph,
+                                       self_transitions = TRUE,
+                                       scale_by_distance = FALSE,
+                                       distances = NULL,
+                                       indices = NULL) {
+  
+  n_cells <- nrow(graph)
+  
+  # Make a copy
+  T <- graph
+  
+  # Scale by distance if requested
+  if (scale_by_distance && !is.null(distances) && !is.null(indices)) {
+    # Create distance-based scaling
+    scale_factor <- matrix(1, n_cells, n_cells)
+    
+    for (i in seq_len(n_cells)) {
+      neighbors <- indices[i, ]
+      dists <- distances[i, ]
+      
+      for (k in seq_along(neighbors)) {
+        j <- neighbors[k]
+        if (j > 0 && j <= n_cells) {
+          # Gaussian kernel
+          scale_factor[i, j] <- exp(-dists[k]^2 / (2 * median(dists[dists > 0])^2))
+        }
+      }
+    }
+    
+    T <- T * scale_factor
+  }
+  
+  # Add self-transitions based on velocity confidence
+  if (self_transitions) {
+    row_sums <- rowSums(T)
+    max_sum <- max(row_sums[is.finite(row_sums)])
+    
+    self_trans <- 1 - row_sums / max_sum
+    self_trans[!is.finite(self_trans)] <- 0
+    self_trans <- pmax(self_trans, 0)
+    
+    diag(T) <- self_trans
+  }
+  
+  # Row-normalize
+  row_sums <- rowSums(T)
+  row_sums[row_sums == 0] <- 1
+  
+  T <- T / row_sums
+  
+  T
+}
+
+#' Velocity Confidence
+#'
+#' @description Compute confidence scores for velocity estimates.
+#'
+#' @param object Seurat object with velocity graph
+#'
+#' @return Seurat object with velocity_confidence in metadata
+#' @export
+velocity_confidence <- function(object) {
+  
+  if (is.null(object@misc$scVeloR$velocity_graph$graph)) {
+    stop("Run velocity_graph() first")
+  }
+  
+  graph <- object@misc$scVeloR$velocity_graph$graph
+  
+  # Confidence = mean correlation with neighbors
+  n_cells <- nrow(graph)
+  
+  confidence <- numeric(n_cells)
+  
+  for (i in seq_len(n_cells)) {
+    row <- graph[i, ]
+    nonzero <- which(row > 0)
+    
+    if (length(nonzero) > 0) {
+      confidence[i] <- mean(row[nonzero])
+    }
+  }
+  
+  # Scale to [0, 1]
+  confidence <- (confidence - min(confidence)) / (max(confidence) - min(confidence) + 1e-10)
+  
+  object@meta.data$velocity_confidence <- confidence
+  
+  object
+}
+
+#' Velocity Coherence
+#'
+#' @description Compute coherence of velocity with neighboring cells.
+#'
+#' @param object Seurat object with velocity
+#' @param n_neighbors Number of neighbors
+#'
+#' @return Seurat object with velocity_coherence in metadata
+#' @export
+velocity_coherence <- function(object, n_neighbors = 30) {
+  
+  if (is.null(object@misc$scVeloR$velocity$velocity_s)) {
+    stop("Run velocity() first")
+  }
+  
+  velocity <- object@misc$scVeloR$velocity$velocity_s
+  velocity_genes <- object@misc$scVeloR$velocity$velocity_genes
+  velocity <- velocity[, velocity_genes, drop = FALSE]
+  
+  # Get neighbors
+  if (is.null(object@misc$scVeloR$neighbors)) {
+    object <- compute_neighbors(object, n_neighbors = n_neighbors, verbose = FALSE)
+  }
+  
+  indices <- object@misc$scVeloR$neighbors$indices
+  
+  n_cells <- nrow(velocity)
+  coherence <- numeric(n_cells)
+  
+  for (i in seq_len(n_cells)) {
+    v_i <- velocity[i, ]
+    v_i_norm <- sqrt(sum(v_i^2))
+    
+    if (v_i_norm == 0) next
+    
+    neighbors <- indices[i, ]
+    neighbors <- neighbors[neighbors > 0 & neighbors <= n_cells]
+    
+    if (length(neighbors) == 0) next
+    
+    correlations <- numeric(length(neighbors))
+    
+    for (k in seq_along(neighbors)) {
+      j <- neighbors[k]
+      v_j <- velocity[j, ]
+      v_j_norm <- sqrt(sum(v_j^2))
+      
+      if (v_j_norm > 0) {
+        correlations[k] <- sum(v_i * v_j) / (v_i_norm * v_j_norm)
+      }
+    }
+    
+    coherence[i] <- mean(correlations)
+  }
+  
+  # Scale
+  coherence <- (coherence - min(coherence)) / (max(coherence) - min(coherence) + 1e-10)
+  
+  object@meta.data$velocity_coherence <- coherence
+  
+  object
 }

@@ -1,371 +1,424 @@
 #' @title Preprocessing Functions
-#' @description Functions for preprocessing single-cell data for velocity analysis.
+#' @description Data preprocessing functions for RNA velocity analysis.
 #' @name preprocessing
 NULL
 
-#' Filter Genes for Velocity Analysis
+#' Filter Genes
 #'
-#' @description Filter genes based on minimum counts and expression in cells.
+#' @description Filter genes based on expression criteria.
 #'
-#' @param seurat_obj A Seurat object with spliced and unspliced layers
-#' @param min_counts Minimum total counts per gene (default: 10)
-#' @param min_cells Minimum number of cells expressing the gene (default: 10)
-#' @param min_counts_u Minimum unspliced counts per gene (default: 5)
-#' @param min_cells_u Minimum cells with unspliced expression (default: 5)
-#' @param spliced_layer Name of spliced layer (default: "spliced")
-#' @param unspliced_layer Name of unspliced layer (default: "unspliced")
-#' @param retain_genes Genes to always retain regardless of filtering
+#' @param object Seurat object
+#' @param min_counts Minimum total counts per gene
+#' @param min_cells Minimum cells expressing the gene
+#' @param min_shared_counts Minimum shared counts (u and s > 0)
+#' @param min_shared_cells Minimum cells with both u and s
+#' @param spliced_layer Name of spliced layer
+#' @param unspliced_layer Name of unspliced layer
+#' @param verbose Print progress
 #'
-#' @return Modified Seurat object with velocity_genes in var metadata
-#'
+#' @return Seurat object with filtered gene metadata
 #' @export
-filter_genes <- function(seurat_obj,
-                          min_counts = 10,
-                          min_cells = 10,
-                          min_counts_u = 5,
-                          min_cells_u = 5,
-                          spliced_layer = "spliced",
-                          unspliced_layer = "unspliced",
-                          retain_genes = NULL) {
+filter_genes <- function(object,
+                         min_counts = 20,
+                         min_cells = 10,
+                         min_shared_counts = 10,
+                         min_shared_cells = 5,
+                         spliced_layer = "spliced",
+                         unspliced_layer = "unspliced",
+                         verbose = TRUE) {
   
-  # Extract data
-  data <- extract_velocity_data(seurat_obj, spliced_layer, unspliced_layer)
-  spliced <- data$spliced
-  unspliced <- data$unspliced
-  genes <- data$genes
+  # Get spliced and unspliced matrices
+  spliced <- get_layer_matrix(object, spliced_layer)
+  unspliced <- get_layer_matrix(object, unspliced_layer)
   
-  n_genes_initial <- length(genes)
+  n_genes <- ncol(spliced)
   
-  # Calculate statistics
-  spliced_counts <- Matrix::rowSums(spliced)
-  unspliced_counts <- Matrix::rowSums(unspliced)
-  spliced_cells <- Matrix::rowSums(spliced > 0)
-  unspliced_cells <- Matrix::rowSums(unspliced > 0)
+  # Compute gene statistics
+  s_counts <- colSums(spliced)
+  u_counts <- colSums(unspliced)
+  s_cells <- colSums(spliced > 0)
+  u_cells <- colSums(unspliced > 0)
+  
+  # Shared expression (both u and s > 0)
+  shared <- (spliced > 0) & (unspliced > 0)
+  shared_counts <- colSums(spliced * shared + unspliced * shared)
+  shared_cells <- colSums(shared)
   
   # Apply filters
-  pass_filter <- (spliced_counts >= min_counts) &
-                 (spliced_cells >= min_cells) &
-                 (unspliced_counts >= min_counts_u) &
-                 (unspliced_cells >= min_cells_u)
+  pass_filter <- (s_counts >= min_counts) &
+                 (u_counts >= min_counts) &
+                 (s_cells >= min_cells) &
+                 (u_cells >= min_cells) &
+                 (shared_counts >= min_shared_counts) &
+                 (shared_cells >= min_shared_cells)
   
-  # Retain specified genes
-  if (!is.null(retain_genes)) {
-    retain_idx <- genes %in% retain_genes
-    pass_filter <- pass_filter | retain_idx
+  n_passed <- sum(pass_filter)
+  
+  if (verbose) {
+    message(sprintf("Filtered genes: %d/%d passed (%.1f%%)", 
+                    n_passed, n_genes, 100 * n_passed / n_genes))
   }
   
-  n_genes_pass <- sum(pass_filter)
-  
-  # Store in metadata
-  version <- .get_seurat_version(seurat_obj)
-  assay_name <- SeuratObject::DefaultAssay(seurat_obj)
-  
-  # Add velocity_genes to var metadata
-  if (version == "v5") {
-    # V5: Use features metadata
-    tryCatch({
-      seurat_obj[[assay_name]]@meta.data$velocity_genes <- pass_filter
-    }, error = function(e) {
-      seurat_obj@misc$velocity_genes <- setNames(pass_filter, genes)
-    })
-  } else {
-    # V4: Add to assay meta.features
-    tryCatch({
-      seurat_obj[[assay_name]]@meta.features$velocity_genes <- pass_filter
-    }, error = function(e) {
-      seurat_obj@misc$velocity_genes <- setNames(pass_filter, genes)
-    })
+  # Store filter results
+  if (is.null(object@misc$scVeloR)) {
+    object@misc$scVeloR <- list()
   }
   
-  .vmessage("Filtered genes: ", n_genes_pass, " / ", n_genes_initial, " passed")
+  object@misc$scVeloR$gene_filter <- pass_filter
+  object@misc$scVeloR$filtered_genes <- colnames(spliced)[pass_filter]
   
-  return(seurat_obj)
+  object
 }
 
-#' Normalize Layers
+#' Filter Cells
 #'
-#' @description Normalize spliced and unspliced counts per cell.
+#' @description Filter cells based on expression criteria.
 #'
-#' @param seurat_obj A Seurat object
-#' @param target_sum Target sum for normalization (default: NULL uses median)
-#' @param log_transform Whether to log-transform (default: FALSE for velocity)
-#' @param spliced_layer Name of spliced layer (default: "spliced")
-#' @param unspliced_layer Name of unspliced layer (default: "unspliced")
+#' @param object Seurat object
+#' @param min_counts Minimum total counts per cell
+#' @param min_genes Minimum genes expressed per cell
+#' @param spliced_layer Name of spliced layer
+#' @param unspliced_layer Name of unspliced layer
+#' @param verbose Print progress
 #'
-#' @return Modified Seurat object with normalized layers
-#'
+#' @return Seurat object (cells in metadata)
 #' @export
-normalize_layers <- function(seurat_obj,
-                              target_sum = NULL,
-                              log_transform = FALSE,
-                              spliced_layer = "spliced",
-                              unspliced_layer = "unspliced") {
+filter_cells <- function(object,
+                         min_counts = 100,
+                         min_genes = 50,
+                         spliced_layer = "spliced",
+                         unspliced_layer = "unspliced",
+                         verbose = TRUE) {
   
-  # Extract data
-  data <- extract_velocity_data(seurat_obj, spliced_layer, unspliced_layer)
-  spliced <- data$spliced
-  unspliced <- data$unspliced
+  spliced <- get_layer_matrix(object, spliced_layer)
+  unspliced <- get_layer_matrix(object, unspliced_layer)
   
-  # Store initial sizes
-  initial_size_spliced <- Matrix::colSums(spliced)
-  initial_size_unspliced <- Matrix::colSums(unspliced)
+  n_cells <- nrow(spliced)
   
-  seurat_obj@meta.data$initial_size_spliced <- initial_size_spliced
-  seurat_obj@meta.data$initial_size_unspliced <- initial_size_unspliced
-  seurat_obj@meta.data$initial_size <- initial_size_spliced + initial_size_unspliced
+  # Compute cell statistics
+  total_counts <- rowSums(spliced) + rowSums(unspliced)
+  n_genes <- rowSums(spliced > 0) + rowSums(unspliced > 0)
   
-  # Determine target sum
-  if (is.null(target_sum)) {
-    target_sum <- stats::median(initial_size_spliced + initial_size_unspliced)
+  pass_filter <- (total_counts >= min_counts) & (n_genes >= min_genes)
+  
+  if (verbose) {
+    message(sprintf("Cell filter: %d/%d passed (%.1f%%)", 
+                    sum(pass_filter), n_cells, 100 * sum(pass_filter) / n_cells))
   }
   
-  # Normalize spliced
-  spliced_norm <- normalize_per_cell(spliced, target_sum, log_transform)
+  object@meta.data$pass_velocity_filter <- pass_filter
   
-  # Normalize unspliced
-  unspliced_norm <- normalize_per_cell(unspliced, target_sum, log_transform)
-  
-  # Store normalized layers
-  seurat_obj <- .set_layer_data(seurat_obj, spliced_layer, spliced_norm)
-  seurat_obj <- .set_layer_data(seurat_obj, unspliced_layer, unspliced_norm)
-  
-  .vmessage("Normalized ", ncol(spliced), " cells to target sum ", round(target_sum, 2))
-  
-  return(seurat_obj)
+  object
 }
 
-#' Normalize Per Cell Helper
+#' Normalize Data
 #'
-#' @param x Sparse matrix (genes x cells)
-#' @param target_sum Target sum per cell
-#' @param log_transform Whether to log-transform
-#' @return Normalized matrix
-#' @keywords internal
-normalize_per_cell <- function(x, target_sum, log_transform = FALSE) {
-  cell_sums <- Matrix::colSums(x)
-  cell_sums[cell_sums == 0] <- 1  # Avoid division by zero
+#' @description Normalize spliced and unspliced counts.
+#'
+#' @param object Seurat object
+#' @param method Normalization method: "log1p" or "total"
+#' @param target_sum Target sum for total normalization
+#' @param spliced_layer Name of spliced layer
+#' @param unspliced_layer Name of unspliced layer
+#'
+#' @return Seurat object with normalized layers
+#' @export
+normalize_layers <- function(object,
+                             method = "log1p",
+                             target_sum = 10000,
+                             spliced_layer = "spliced",
+                             unspliced_layer = "unspliced") {
   
-  # Normalize
-  x_norm <- t(t(x) / cell_sums * target_sum)
+  spliced <- get_layer_matrix(object, spliced_layer)
+  unspliced <- get_layer_matrix(object, unspliced_layer)
   
-  # Log transform if requested
-  if (log_transform) {
-    x_norm@x <- log1p(x_norm@x)
+  if (method == "log1p") {
+    # Size factor normalization + log transform
+    s_size <- rowSums(spliced) / median(rowSums(spliced))
+    u_size <- rowSums(unspliced) / median(rowSums(unspliced))
+    
+    s_size[s_size == 0] <- 1
+    u_size[u_size == 0] <- 1
+    
+    spliced_norm <- log1p(spliced / s_size)
+    unspliced_norm <- log1p(unspliced / u_size)
+    
+  } else if (method == "total") {
+    s_sum <- rowSums(spliced)
+    u_sum <- rowSums(unspliced)
+    
+    s_sum[s_sum == 0] <- 1
+    u_sum[u_sum == 0] <- 1
+    
+    spliced_norm <- spliced / s_sum * target_sum
+    unspliced_norm <- unspliced / u_sum * target_sum
   }
   
-  return(x_norm)
+  # Store normalized data
+  if (is.null(object@misc$scVeloR)) {
+    object@misc$scVeloR <- list()
+  }
+  
+  object@misc$scVeloR$spliced_norm <- spliced_norm
+  object@misc$scVeloR$unspliced_norm <- unspliced_norm
+  
+  object
 }
 
 #' Compute First-Order Moments
 #'
-#' @description Compute smoothed expression values (first-order moments) using 
-#' the neighbor graph.
+#' @description Compute neighbor-averaged expression (first moments).
+#' Ms = smooth(spliced), Mu = smooth(unspliced)
 #'
-#' @param seurat_obj A Seurat object with computed neighbors
-#' @param n_neighbors Number of neighbors (default: 30)
-#' @param mode Use "connectivities" or "distances" (default: "connectivities")
-#' @param spliced_layer Name of spliced layer (default: "spliced")
-#' @param unspliced_layer Name of unspliced layer (default: "unspliced")
+#' @param object Seurat object with neighbors computed
+#' @param n_neighbors Number of neighbors (default uses existing neighbors)
+#' @param use_normalized Use normalized data
+#' @param spliced_layer Name of spliced layer
+#' @param unspliced_layer Name of unspliced layer
+#' @param verbose Print progress
 #'
-#' @return Modified Seurat object with Ms and Mu layers
-#'
+#' @return Seurat object with Ms and Mu in misc$scVeloR
 #' @export
-compute_moments <- function(seurat_obj,
-                             n_neighbors = 30,
-                             mode = "connectivities",
-                             spliced_layer = "spliced",
-                             unspliced_layer = "unspliced") {
+moments <- function(object,
+                    n_neighbors = 30,
+                    use_normalized = TRUE,
+                    spliced_layer = "spliced",
+                    unspliced_layer = "unspliced",
+                    verbose = TRUE) {
   
-  .vmessage("Computing moments based on ", mode)
-  
-  # Check if neighbors exist
-  if (is.null(seurat_obj@misc$neighbors)) {
-    .vmessage("Computing neighbors first...")
-    seurat_obj <- compute_neighbors(seurat_obj, n_neighbors = n_neighbors)
+  if (verbose) {
+    message("Computing moments...")
   }
   
-  # Get connectivities
-  conn <- get_connectivities(seurat_obj, mode = mode, n_neighbors = n_neighbors)
+  # Ensure neighbors are computed
+  if (is.null(object@misc$scVeloR$neighbors)) {
+    object <- compute_neighbors(object, n_neighbors = n_neighbors, verbose = verbose)
+  }
   
-  # Ensure row-normalized
-  conn <- normalize_matrix(conn, axis = 1)
+  conn <- object@misc$scVeloR$neighbors$connectivities
   
-  # Extract data
-  data <- extract_velocity_data(seurat_obj, spliced_layer, unspliced_layer)
-  spliced <- data$spliced
-  unspliced <- data$unspliced
-  
-  # Compute moments using C++ if sparse
-  if (inherits(spliced, "sparseMatrix") && inherits(conn, "sparseMatrix")) {
-    # Use Rcpp function
-    Ms_dense <- compute_moments_sparse_cpp(
-      as(spliced, "dgCMatrix"),
-      as(conn, "dgCMatrix")
-    )
-    Mu_dense <- compute_moments_sparse_cpp(
-      as(unspliced, "dgCMatrix"),
-      as(conn, "dgCMatrix")
-    )
-    
-    Ms <- as(Ms_dense, "CsparseMatrix")
-    Mu <- as(Mu_dense, "CsparseMatrix")
+  # Get expression data
+  if (use_normalized && !is.null(object@misc$scVeloR$spliced_norm)) {
+    spliced <- object@misc$scVeloR$spliced_norm
+    unspliced <- object@misc$scVeloR$unspliced_norm
   } else {
-    # Dense computation
-    spliced_dense <- make_dense(spliced)
-    unspliced_dense <- make_dense(unspliced)
-    conn_dense <- make_dense(conn)
-    
-    Ms <- as(spliced_dense %*% t(conn_dense), "CsparseMatrix")
-    Mu <- as(unspliced_dense %*% t(conn_dense), "CsparseMatrix")
+    spliced <- get_layer_matrix(object, spliced_layer)
+    unspliced <- get_layer_matrix(object, unspliced_layer)
   }
   
-  # Set row and column names
-  rownames(Ms) <- rownames(spliced)
+  # Row normalize connectivities
+  row_sums <- rowSums(conn)
+  row_sums[row_sums == 0] <- 1
+  conn_norm <- conn / row_sums
+  
+  # Compute moments (neighbor averaging)
+  Ms <- as.matrix(conn_norm %*% spliced)
+  Mu <- as.matrix(conn_norm %*% unspliced)
+  
+  # Ensure same dimensions and names
   colnames(Ms) <- colnames(spliced)
-  rownames(Mu) <- rownames(unspliced)
   colnames(Mu) <- colnames(unspliced)
+  rownames(Ms) <- rownames(spliced)
+  rownames(Mu) <- rownames(unspliced)
   
-  # Store moments
-  seurat_obj <- .set_layer_data(seurat_obj, "Ms", Ms)
-  seurat_obj <- .set_layer_data(seurat_obj, "Mu", Mu)
+  # Store results
+  object@misc$scVeloR$Ms <- Ms
+  object@misc$scVeloR$Mu <- Mu
   
-  .vmessage("Added Ms and Mu to layers")
+  if (verbose) {
+    message(sprintf("  Computed moments: Ms %dx%d, Mu %dx%d", 
+                    nrow(Ms), ncol(Ms), nrow(Mu), ncol(Mu)))
+  }
   
-  return(seurat_obj)
+  object
 }
 
 #' Compute Second-Order Moments
 #'
-#' @description Compute second-order moments for stochastic velocity estimation.
+#' @description Compute second-order moments for stochastic velocity.
+#' Mss, Mus, Muu represent variances and covariances.
 #'
-#' @param seurat_obj A Seurat object with computed neighbors
-#' @param spliced_layer Name of spliced layer (default: "spliced")
-#' @param unspliced_layer Name of unspliced layer (default: "unspliced")
-#' @param adjusted Whether to compute adjusted moments (default: FALSE)
+#' @param object Seurat object with neighbors computed
+#' @param use_normalized Use normalized data
+#' @param spliced_layer Name of spliced layer
+#' @param unspliced_layer Name of unspliced layer
+#' @param verbose Print progress
 #'
-#' @return List with Mss and Mus matrices
-#'
-#' @keywords internal
-compute_second_order_moments <- function(seurat_obj,
-                                          spliced_layer = "spliced",
-                                          unspliced_layer = "unspliced",
-                                          adjusted = FALSE) {
+#' @return Seurat object with Mss, Mus, Muu in misc$scVeloR
+#' @export
+second_order_moments <- function(object,
+                                  use_normalized = TRUE,
+                                  spliced_layer = "spliced",
+                                  unspliced_layer = "unspliced",
+                                  verbose = TRUE) {
   
-  # Get connectivities
-  conn <- get_connectivities(seurat_obj)
+  if (verbose) {
+    message("Computing second-order moments...")
+  }
   
-  # Extract data
-  data <- extract_velocity_data(seurat_obj, spliced_layer, unspliced_layer)
-  spliced <- data$spliced
-  unspliced <- data$unspliced
+  if (is.null(object@misc$scVeloR$neighbors)) {
+    stop("Run compute_neighbors() first")
+  }
   
-  if (inherits(spliced, "sparseMatrix") && inherits(conn, "sparseMatrix")) {
-    # Use C++ functions
-    Mss <- compute_second_moments_sparse_cpp(
-      as(spliced, "dgCMatrix"),
-      as(conn, "dgCMatrix")
-    )
-    Mus <- compute_cross_moments_sparse_cpp(
-      as(unspliced, "dgCMatrix"),
-      as(spliced, "dgCMatrix"),
-      as(conn, "dgCMatrix")
-    )
+  conn <- object@misc$scVeloR$neighbors$connectivities
+  
+  # Get expression data
+  if (use_normalized && !is.null(object@misc$scVeloR$spliced_norm)) {
+    s <- object@misc$scVeloR$spliced_norm
+    u <- object@misc$scVeloR$unspliced_norm
   } else {
-    # Dense computation
-    s <- make_dense(spliced)
-    u <- make_dense(unspliced)
-    conn_dense <- make_dense(conn)
-    
-    Mss <- (s * s) %*% t(conn_dense)
-    Mus <- (s * u) %*% t(conn_dense)
+    s <- get_layer_matrix(object, spliced_layer)
+    u <- get_layer_matrix(object, unspliced_layer)
   }
   
-  if (adjusted) {
-    Ms <- .get_layer_data(seurat_obj, "Ms")
-    Mu <- .get_layer_data(seurat_obj, "Mu")
-    Mss <- 2 * Mss - make_dense(Ms)
-    Mus <- 2 * Mus - make_dense(Mu)
+  # Row normalize
+  row_sums <- rowSums(conn)
+  row_sums[row_sums == 0] <- 1
+  conn_norm <- conn / row_sums
+  
+  # Compute <s^2>, <su>, <u^2>
+  Mss <- as.matrix(conn_norm %*% (s^2))
+  Mus <- as.matrix(conn_norm %*% (s * u))
+  Muu <- as.matrix(conn_norm %*% (u^2))
+  
+  # Store
+  object@misc$scVeloR$Mss <- Mss
+  object@misc$scVeloR$Mus <- Mus
+  object@misc$scVeloR$Muu <- Muu
+  
+  if (verbose) {
+    message("  Computed second-order moments")
   }
   
-  list(Mss = Mss, Mus = Mus)
+  object
 }
 
-#' Filter and Normalize (One-Step Preprocessing)
+#' Get Layer Matrix
 #'
-#' @description Perform all preprocessing steps in one call.
+#' @description Extract layer matrix from Seurat object.
+#' Handles both Seurat V4 and V5 object structures.
 #'
-#' @param seurat_obj A Seurat object with spliced and unspliced layers
-#' @param min_counts Minimum total counts per gene (default: 10)
-#' @param min_cells Minimum number of cells expressing the gene (default: 10)
-#' @param min_counts_u Minimum unspliced counts per gene (default: 5)
-#' @param min_cells_u Minimum cells with unspliced expression (default: 5)
-#' @param n_neighbors Number of neighbors for moment computation (default: 30)
-#' @param target_sum Target sum for normalization (default: NULL uses median)
-#' @param spliced_layer Name of spliced layer (default: "spliced")
-#' @param unspliced_layer Name of unspliced layer (default: "unspliced")
+#' @param object Seurat object
+#' @param layer_name Name of layer
 #'
-#' @return Preprocessed Seurat object
+#' @return Dense matrix (cells x genes)
+#' @keywords internal
+get_layer_matrix <- function(object, layer_name) {
+  
+  # Try Seurat V5 structure first
+  if ("Assay5" %in% class(object@assays[[Seurat::DefaultAssay(object)]])) {
+    # V5: Use LayerData
+    if (layer_name %in% Seurat::Layers(object)) {
+      mat <- Seurat::LayerData(object, layer = layer_name)
+    } else {
+      stop(sprintf("Layer '%s' not found", layer_name))
+    }
+  } else {
+    # V4: Use GetAssayData
+    if (layer_name %in% names(object@assays[[Seurat::DefaultAssay(object)]]@layers)) {
+      mat <- Seurat::GetAssayData(object, slot = layer_name)
+    } else if (layer_name %in% slotNames(object@assays[[Seurat::DefaultAssay(object)]])) {
+      mat <- slot(object@assays[[Seurat::DefaultAssay(object)]], layer_name)
+    } else {
+      stop(sprintf("Layer '%s' not found", layer_name))
+    }
+  }
+  
+  # Convert to dense matrix (cells x genes)
+  if (inherits(mat, "sparseMatrix")) {
+    mat <- as.matrix(mat)
+  }
+  
+  if (nrow(mat) != ncol(object)) {
+    mat <- t(mat)
+  }
+  
+  mat
+}
+
+#' Get Velocity Data
 #'
+#' @description Get expression data for velocity computation.
+#' Returns Ms/Mu if available, otherwise raw spliced/unspliced.
+#'
+#' @param object Seurat object
+#' @param spliced_layer Name of spliced layer
+#' @param unspliced_layer Name of unspliced layer
+#' @param use_moments Use moment-averaged data if available
+#'
+#' @return List with Ms and Mu matrices
+#' @keywords internal
+get_velocity_data <- function(object,
+                              spliced_layer = "spliced",
+                              unspliced_layer = "unspliced",
+                              use_moments = TRUE) {
+  
+  if (use_moments && !is.null(object@misc$scVeloR$Ms)) {
+    Ms <- object@misc$scVeloR$Ms
+    Mu <- object@misc$scVeloR$Mu
+  } else {
+    Ms <- get_layer_matrix(object, spliced_layer)
+    Mu <- get_layer_matrix(object, unspliced_layer)
+  }
+  
+  list(Ms = Ms, Mu = Mu)
+}
+
+#' Prepare Seurat Object for Velocity
+#'
+#' @description Convenience function to run all preprocessing steps.
+#'
+#' @param object Seurat object
+#' @param min_counts Minimum counts for gene filtering
+#' @param min_cells Minimum cells for gene filtering
+#' @param n_neighbors Number of neighbors
+#' @param n_pcs Number of PCs for neighbor computation
+#' @param spliced_layer Name of spliced layer
+#' @param unspliced_layer Name of unspliced layer
+#' @param verbose Print progress
+#'
+#' @return Processed Seurat object ready for velocity computation
 #' @export
-#' @examples
-#' \dontrun{
-#' seurat_obj <- filter_and_normalize(seurat_obj)
-#' }
-filter_and_normalize <- function(seurat_obj,
-                                   min_counts = 10,
-                                   min_cells = 10,
-                                   min_counts_u = 5,
-                                   min_cells_u = 5,
-                                   n_neighbors = 30,
-                                   target_sum = NULL,
-                                   spliced_layer = "spliced",
-                                   unspliced_layer = "unspliced") {
+prepare_velocity <- function(object,
+                             min_counts = 20,
+                             min_cells = 10,
+                             n_neighbors = 30,
+                             n_pcs = 30,
+                             spliced_layer = "spliced",
+                             unspliced_layer = "unspliced",
+                             verbose = TRUE) {
   
-  .vmessage("Preprocessing data...")
-  
-  # Store proportions
-  show_proportions(seurat_obj, spliced_layer, unspliced_layer)
+  if (verbose) {
+    message("Preparing Seurat object for velocity analysis...")
+  }
   
   # Filter genes
-  seurat_obj <- filter_genes(seurat_obj,
-                              min_counts = min_counts,
-                              min_cells = min_cells,
-                              min_counts_u = min_counts_u,
-                              min_cells_u = min_cells_u,
-                              spliced_layer = spliced_layer,
-                              unspliced_layer = unspliced_layer)
+  object <- filter_genes(object, 
+                         min_counts = min_counts, 
+                         min_cells = min_cells,
+                         spliced_layer = spliced_layer,
+                         unspliced_layer = unspliced_layer,
+                         verbose = verbose)
   
   # Normalize
-  seurat_obj <- normalize_layers(seurat_obj,
-                                  target_sum = target_sum,
-                                  spliced_layer = spliced_layer,
-                                  unspliced_layer = unspliced_layer)
+  object <- normalize_layers(object,
+                             spliced_layer = spliced_layer,
+                             unspliced_layer = unspliced_layer)
   
-  .vmessage("Preprocessing complete")
+  if (verbose) message("  Normalized expression data")
   
-  return(seurat_obj)
-}
-
-#' Check if Data is Already Normalized
-#'
-#' @param x Sparse matrix
-#' @return Logical
-#' @keywords internal
-is_normalized <- function(x) {
-  # Check if values look normalized (most values < 100)
-  if (inherits(x, "sparseMatrix")) {
-    sample_vals <- x@x[seq(1, min(length(x@x), 10000))]
-  } else {
-    sample_vals <- as.vector(x[seq(1, min(length(x), 10000))])
+  # Compute neighbors
+  object <- compute_neighbors(object, 
+                              n_neighbors = n_neighbors, 
+                              n_pcs = n_pcs,
+                              verbose = verbose)
+  
+  # Compute moments
+  object <- moments(object, verbose = verbose)
+  
+  if (verbose) {
+    message("Done. Object is ready for velocity computation.")
   }
   
-  # If most values are small floats, probably normalized
-  max_val <- max(sample_vals, na.rm = TRUE)
-  median_val <- stats::median(sample_vals[sample_vals > 0], na.rm = TRUE)
-  
-  # Heuristic: raw counts tend to be integers and can be large
-  is_float <- any(sample_vals != floor(sample_vals))
-  is_small <- median_val < 10
-  
-  return(is_float && is_small)
+  object
 }

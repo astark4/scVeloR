@@ -1,301 +1,301 @@
-#' @title Main Velocity Function
-#' @description Main interface for RNA velocity estimation.
+#' @title RNA Velocity Estimation
+#' @description Main entry point for RNA velocity computation.
 #' @name velocity
 NULL
 
-#' Estimate RNA Velocity
+#' Compute RNA Velocity
 #'
-#' @description Main function for estimating RNA velocity. Supports steady-state,
-#' stochastic, and dynamical models.
+#' @description Main function to compute RNA velocity.
+#' Supports three modes: "deterministic" (steady-state), "stochastic", and "dynamical".
 #'
-#' @param seurat_obj A Seurat object with computed moments
-#' @param mode Velocity mode: "steady_state" (default), "stochastic", or "dynamical"
-#' @param fit_offset Whether to fit offset (default: FALSE for deterministic models)
-#' @param min_r2 Minimum R-squared to consider a gene well-fit (default: 0.01)
-#' @param min_likelihood Minimum likelihood for dynamical model (default: 0.001)
-#' @param n_jobs Number of parallel jobs (default: 1)
-#' @param copy Return copy instead of modifying in place (default: FALSE)
+#' @param object Seurat object with spliced and unspliced data
+#' @param mode Velocity mode: "deterministic", "stochastic", or "dynamical"
+#' @param min_r2 Minimum R-squared for velocity genes (for deterministic/stochastic)
+#' @param max_iter Maximum iterations (for dynamical mode)
+#' @param n_top_genes Number of top genes for dynamical mode
+#' @param fit_scaling Fit scaling parameter (for dynamical)
+#' @param n_cores Number of cores for parallel computation
+#' @param verbose Print progress
+#' @param ... Additional arguments passed to specific velocity functions
 #'
-#' @return Modified Seurat object with velocity estimates
+#' @return Seurat object with velocity results in misc$scVeloR$velocity
 #'
-#' @export
+#' @details
+#' The function supports three velocity estimation modes:
+#'
+#' \describe{
+#'   \item{deterministic}{Steady-state model assuming du/dt ≈ 0 at equilibrium.
+#'     Uses linear regression to estimate gamma = u/s ratio.}
+#'   \item{stochastic}{Uses second-order moments (variance, covariance) to
+#'     account for transcriptional noise and bursting.}
+#'   \item{dynamical}{Full kinetics model using EM algorithm to infer
+#'     transcription (alpha), splicing (beta), and degradation (gamma) rates.}
+#' }
+#'
 #' @examples
 #' \dontrun{
-#' # Steady-state model
-#' seurat_obj <- velocity(seurat_obj, mode = "steady_state")
+#' # Basic velocity computation
+#' seurat_obj <- velocity(seurat_obj, mode = "deterministic")
 #'
-#' # Stochastic model
-#' seurat_obj <- velocity(seurat_obj, mode = "stochastic")
-#'
-#' # Dynamical model (requires recover_dynamics first)
-#' seurat_obj <- recover_dynamics(seurat_obj)
-#' seurat_obj <- velocity(seurat_obj, mode = "dynamical")
+#' # Dynamical model
+#' seurat_obj <- velocity(seurat_obj, mode = "dynamical", max_iter = 10)
 #' }
-velocity <- function(seurat_obj,
-                      mode = c("steady_state", "stochastic", "dynamical"),
-                      fit_offset = FALSE,
-                      min_r2 = 0.01,
-                      min_likelihood = 0.001,
-                      n_jobs = 1L,
-                      copy = FALSE) {
+#'
+#' @export
+velocity <- function(object,
+                     mode = "deterministic",
+                     min_r2 = 0.01,
+                     max_iter = 10,
+                     n_top_genes = 2000,
+                     fit_scaling = TRUE,
+                     n_cores = 1,
+                     verbose = TRUE,
+                     ...) {
   
-  mode <- match.arg(mode)
-  
-  if (copy) {
-    seurat_obj <- seurat_obj  # R creates copy on modification anyway
+  if (verbose) {
+    message(sprintf("Computing RNA velocity (mode: %s)...", mode))
   }
   
-  .vmessage("Estimating velocity using ", mode, " model")
-  
-  # Check prerequisites
-  if (!.layer_exists(seurat_obj, "Ms") || !.layer_exists(seurat_obj, "Mu")) {
-    .vmessage("Moments not found, computing...")
-    seurat_obj <- compute_moments(seurat_obj)
+  # Ensure moments are computed
+  if (is.null(object@misc$scVeloR$Ms)) {
+    if (verbose) message("  Computing moments first...")
+    object <- moments(object, verbose = verbose)
   }
   
-  # Dispatch to appropriate model
-  if (mode == "steady_state") {
-    seurat_obj <- fit_velocity_steady(seurat_obj,
-                                       fit_intercept = fit_offset,
-                                       min_r2 = min_r2,
-                                       n_jobs = n_jobs)
+  # Compute velocity based on mode
+  if (mode == "deterministic" || mode == "steady_state") {
+    object <- velocity_steady_state(
+      object = object,
+      min_r2 = min_r2,
+      n_cores = n_cores,
+      verbose = verbose,
+      ...
+    )
+    
   } else if (mode == "stochastic") {
-    seurat_obj <- fit_velocity_stochastic(seurat_obj,
-                                           fit_offset = fit_offset,
-                                           min_r2 = min_r2,
-                                           n_jobs = n_jobs)
+    object <- velocity_stochastic(
+      object = object,
+      min_r2 = min_r2,
+      n_cores = n_cores,
+      verbose = verbose,
+      ...
+    )
+    
   } else if (mode == "dynamical") {
-    # For dynamical model, dynamics must be recovered first
-    if (is.null(seurat_obj@misc$dynamics_recovered)) {
-      stop("Dynamics not recovered. Run recover_dynamics first.", call. = FALSE)
-    }
-    seurat_obj <- fit_velocity_dynamical(seurat_obj,
-                                          min_likelihood = min_likelihood,
-                                          n_jobs = n_jobs)
-  }
-  
-  .vmessage("Velocity estimation complete")
-  
-  return(seurat_obj)
-}
-
-#' Get Velocity Matrix
-#'
-#' @description Extract velocity matrix from Seurat object.
-#'
-#' @param seurat_obj A Seurat object with computed velocity
-#' @param genes Genes to include (NULL for all)
-#' @param remove_na Whether to remove genes with NA velocities
-#'
-#' @return Velocity matrix (genes x cells)
-#'
-#' @export
-get_velocity <- function(seurat_obj, genes = NULL, remove_na = TRUE) {
-  
-  if (!.layer_exists(seurat_obj, "velocity")) {
-    stop("Velocity not found. Run velocity() first.", call. = FALSE)
-  }
-  
-  velocity <- .get_layer_data(seurat_obj, "velocity")
-  
-  # Subset genes
-  if (!is.null(genes)) {
-    genes <- intersect(genes, rownames(velocity))
-    velocity <- velocity[genes, , drop = FALSE]
-  }
-  
-  # Remove NA genes
-  if (remove_na) {
-    na_genes <- Matrix::rowSums(is.na(velocity)) == ncol(velocity)
-    velocity <- velocity[!na_genes, , drop = FALSE]
-  }
-  
-  return(velocity)
-}
-
-#' Get Velocity Mode
-#'
-#' @description Get the mode used for velocity estimation.
-#'
-#' @param seurat_obj A Seurat object
-#' @return Character string: "steady_state", "stochastic", or "dynamical"
-#'
-#' @export
-get_velocity_mode <- function(seurat_obj) {
-  mode <- seurat_obj@misc$velocity_mode
-  if (is.null(mode)) {
-    return(NA_character_)
-  }
-  return(mode)
-}
-
-#' Fit Dynamical Velocity
-#'
-#' @description Calculate velocity from fitted dynamical parameters.
-#'
-#' @param seurat_obj A Seurat object with recovered dynamics
-#' @param min_likelihood Minimum likelihood (default: 0.001)
-#' @param n_jobs Number of parallel jobs
-#'
-#' @return Modified Seurat object with velocity
-#'
-#' @keywords internal
-fit_velocity_dynamical <- function(seurat_obj,
-                                    min_likelihood = 0.001,
-                                    n_jobs = 1L) {
-  
-  .vmessage("Computing velocity from dynamical model...")
-  
-  # Get fit parameters
-  fit_params <- get_fit_params(seurat_obj)
-  
-  if (is.null(fit_params) || !"fit_alpha" %in% colnames(fit_params)) {
-    stop("Dynamical parameters not found. Run recover_dynamics first.", call. = FALSE)
-  }
-  
-  # Get moments
-  Ms <- make_dense(.get_layer_data(seurat_obj, "Ms"))
-  Mu <- make_dense(.get_layer_data(seurat_obj, "Mu"))
-  
-  genes <- rownames(Ms)
-  n_genes <- length(genes)
-  n_cells <- ncol(Ms)
-  
-  # Get parameters
-  alpha <- fit_params$fit_alpha
-  beta <- fit_params$fit_beta
-  gamma <- fit_params$fit_gamma
-  likelihood <- fit_params$fit_likelihood
-  
-  # Determine velocity genes
-  velocity_genes <- !is.na(alpha) & !is.na(gamma) &
-                     gamma > 0 &
-                     (is.na(likelihood) | likelihood >= min_likelihood)
-  
-  # Calculate velocity: v = alpha/gamma * beta*u - gamma*s
-  # Simplified: v = beta * u - gamma * s  (when at steady state)
-  velocity <- matrix(NA_real_, nrow = n_genes, ncol = n_cells)
-  rownames(velocity) <- genes
-  colnames(velocity) <- colnames(Ms)
-  
-  for (i in which(velocity_genes)) {
-    u <- Mu[i, ]
-    s <- Ms[i, ]
+    # First run steady-state to identify velocity genes
+    if (verbose) message("  Identifying velocity genes...")
+    object <- velocity_steady_state(
+      object = object,
+      min_r2 = min_r2,
+      n_cores = n_cores,
+      verbose = FALSE
+    )
     
-    # Get gene-specific time if available
-    if ("fit_t_" %in% colnames(fit_params)) {
-      t_ <- fit_params$fit_t_[i]
-    } else {
-      t_ <- NA
-    }
+    # Run dynamical recovery
+    object <- recover_dynamics(
+      object = object,
+      genes = "velocity_genes",
+      n_top_genes = n_top_genes,
+      max_iter = max_iter,
+      fit_scaling = fit_scaling,
+      n_cores = n_cores,
+      verbose = verbose,
+      ...
+    )
     
-    # Compute velocity
-    # For on-state: v = alpha - beta*u = beta*(alpha/beta - u)
-    # For off-state: v = -beta*u
-    # Simplified steady-state approximation: v = beta*u - gamma*s
+    # Compute velocity from dynamics
+    object <- velocity_from_dynamics(object, ...)
     
-    b <- beta[i]
-    g <- gamma[i]
-    
-    if (!is.na(b) && !is.na(g) && g > 0) {
-      velocity[i, ] <- b * u - g * s
-    }
-  }
-  
-  # Store velocity
-  velocity <- as(velocity, "CsparseMatrix")
-  seurat_obj <- .set_layer_data(seurat_obj, "velocity", velocity)
-  
-  # Update velocity genes
-  fit_params$velocity_genes <- velocity_genes
-  seurat_obj <- store_fit_params(seurat_obj, fit_params)
-  
-  seurat_obj@misc$velocity_mode <- "dynamical"
-  
-  n_fit <- sum(velocity_genes, na.rm = TRUE)
-  .vmessage("Computed velocity for ", n_fit, " genes")
-  
-  return(seurat_obj)
-}
-
-#' Rank Velocity Genes
-#'
-#' @description Rank genes by their velocity fit quality or other metrics.
-#'
-#' @param seurat_obj A Seurat object with fitted velocity
-#' @param groupby Column name to group cells
-#' @param groups Groups to compare (default: all)
-#' @param n_genes Number of top genes to return
-#' @param min_r2 Minimum R-squared
-#' @param method Ranking method: "r2" (default), "velocity_var", "likelihood"
-#'
-#' @return Data frame with ranked genes
-#'
-#' @export
-rank_velocity_genes <- function(seurat_obj,
-                                 groupby = NULL,
-                                 groups = NULL,
-                                 n_genes = 20,
-                                 min_r2 = 0.01,
-                                 method = "r2") {
-  
-  # Get fit parameters
-  fit_params <- get_fit_params(seurat_obj)
-  
-  if (is.null(fit_params)) {
-    stop("Fit parameters not found. Run velocity() first.", call. = FALSE)
-  }
-  
-  genes <- rownames(fit_params)
-  
-  # Filter by minimum criteria
-  mask <- rep(TRUE, nrow(fit_params))
-  
-  if ("fit_r2" %in% colnames(fit_params)) {
-    mask <- mask & !is.na(fit_params$fit_r2) & (fit_params$fit_r2 >= min_r2)
-  }
-  
-  if ("velocity_genes" %in% colnames(fit_params)) {
-    mask <- mask & fit_params$velocity_genes
-  }
-  
-  # Get ranking metric
-  if (method == "r2" && "fit_r2" %in% colnames(fit_params)) {
-    score <- fit_params$fit_r2
-  } else if (method == "likelihood" && "fit_likelihood" %in% colnames(fit_params)) {
-    score <- fit_params$fit_likelihood
   } else {
-    # Default to r2
-    if ("fit_r2" %in% colnames(fit_params)) {
-      score <- fit_params$fit_r2
-    } else {
-      score <- rep(0, nrow(fit_params))
-    }
+    stop(sprintf("Unknown velocity mode: '%s'. Use 'deterministic', 'stochastic', or 'dynamical'.", mode))
   }
   
-  # Apply mask
-  score[!mask] <- NA
+  object
+}
+
+#' Full Velocity Pipeline
+#'
+#' @description Run complete velocity analysis pipeline:
+#' preprocessing, velocity computation, embedding projection, and visualization.
+#'
+#' @param object Seurat object with spliced and unspliced data
+#' @param mode Velocity mode
+#' @param embedding Embedding to project velocity onto
+#' @param n_neighbors Number of neighbors
+#' @param min_counts Minimum counts for gene filtering
+#' @param min_cells Minimum cells for gene filtering
+#' @param n_cores Number of cores
+#' @param verbose Print progress
+#' @param ... Additional arguments
+#'
+#' @return Seurat object with full velocity analysis results
+#'
+#' @examples
+#' \dontrun{
+#' seurat_obj <- run_velocity(seurat_obj, mode = "dynamical")
+#' plot_velocity(seurat_obj)
+#' }
+#'
+#' @export
+run_velocity <- function(object,
+                         mode = "deterministic",
+                         embedding = "umap",
+                         n_neighbors = 30,
+                         min_counts = 20,
+                         min_cells = 10,
+                         n_cores = 1,
+                         verbose = TRUE,
+                         ...) {
   
-  # Rank
-  rank_order <- order(score, decreasing = TRUE, na.last = TRUE)
+  if (verbose) {
+    message("Running full velocity pipeline...")
+  }
   
-  # Select top genes
-  n_genes <- min(n_genes, sum(mask))
-  top_indices <- rank_order[seq_len(n_genes)]
-  
-  # Create result data frame
-  result <- data.frame(
-    gene = genes[top_indices],
-    score = score[top_indices],
-    row.names = NULL
+  # Step 1: Preprocessing
+  if (verbose) message("\n[Step 1/5] Preprocessing...")
+  object <- prepare_velocity(
+    object = object,
+    n_neighbors = n_neighbors,
+    min_counts = min_counts,
+    min_cells = min_cells,
+    verbose = verbose
   )
   
-  # Add other metrics if available
-  for (col in c("fit_gamma", "fit_r2", "fit_likelihood")) {
-    if (col %in% colnames(fit_params)) {
-      result[[col]] <- fit_params[[col]][top_indices]
+  # Step 2: Compute velocity
+  if (verbose) message("\n[Step 2/5] Computing velocity...")
+  object <- velocity(
+    object = object,
+    mode = mode,
+    n_cores = n_cores,
+    verbose = verbose,
+    ...
+  )
+  
+  # Step 3: Build velocity graph
+  if (verbose) message("\n[Step 3/5] Building velocity graph...")
+  object <- velocity_graph(
+    object = object,
+    n_neighbors = n_neighbors,
+    n_cores = n_cores,
+    verbose = verbose
+  )
+  
+  # Step 4: Project velocity onto embedding
+  if (verbose) message("\n[Step 4/5] Projecting velocity onto embedding...")
+  
+  # Check if embedding exists
+  emb <- get_embedding(object, embedding)
+  if (is.null(emb)) {
+    warning(sprintf("Embedding '%s' not found. Skipping velocity embedding.", embedding))
+  } else {
+    object <- velocity_embedding(
+      object = object,
+      embedding_name = embedding,
+      verbose = verbose
+    )
+  }
+  
+  # Step 5: Compute latent time if using dynamical mode
+  if (mode == "dynamical") {
+    if (verbose) message("\n[Step 5/5] Computing latent time...")
+    object <- compute_latent_time(object, verbose = verbose)
+  } else {
+    if (verbose) message("\n[Step 5/5] Skipping latent time (not dynamical mode)")
+  }
+  
+  if (verbose) {
+    message("\n✓ Velocity pipeline complete!")
+    message("  Use plot_velocity() or plot_velocity_stream() to visualize results.")
+  }
+  
+  object
+}
+
+#' Get Velocity Summary
+#'
+#' @description Print summary of velocity analysis results.
+#'
+#' @param object Seurat object with velocity computed
+#'
+#' @return Invisible NULL, prints summary
+#' @export
+velocity_summary <- function(object) {
+  
+  cat("\n=== scVeloR Velocity Analysis Summary ===\n\n")
+  
+  if (is.null(object@misc$scVeloR)) {
+    cat("No velocity analysis found. Run velocity() first.\n")
+    return(invisible(NULL))
+  }
+  
+  scVeloR <- object@misc$scVeloR
+  
+  # Preprocessing
+  cat("Preprocessing:\n")
+  if (!is.null(scVeloR$Ms)) {
+    cat(sprintf("  - Moments: Ms (%d x %d), Mu (%d x %d)\n",
+                nrow(scVeloR$Ms), ncol(scVeloR$Ms),
+                nrow(scVeloR$Mu), ncol(scVeloR$Mu)))
+  }
+  if (!is.null(scVeloR$neighbors)) {
+    cat(sprintf("  - Neighbors: %d neighbors computed\n",
+                ncol(scVeloR$neighbors$indices)))
+  }
+  
+  # Velocity
+  cat("\nVelocity:\n")
+  if (!is.null(scVeloR$velocity)) {
+    vel <- scVeloR$velocity
+    cat(sprintf("  - Mode: %s\n", vel$mode))
+    cat(sprintf("  - Velocity genes: %d\n", length(vel$velocity_genes)))
+    
+    if (!is.null(vel$r2)) {
+      r2_valid <- vel$r2[!is.na(vel$r2)]
+      cat(sprintf("  - R² range: [%.3f, %.3f], median: %.3f\n",
+                  min(r2_valid), max(r2_valid), median(r2_valid)))
+    }
+  } else {
+    cat("  - Not computed\n")
+  }
+  
+  # Dynamics
+  if (!is.null(scVeloR$dynamics)) {
+    cat("\nDynamical model:\n")
+    params <- scVeloR$dynamics$gene_params
+    n_fitted <- sum(!is.na(params$alpha))
+    cat(sprintf("  - Fitted genes: %d\n", n_fitted))
+    
+    if (n_fitted > 0) {
+      lik_valid <- params$likelihood[!is.na(params$likelihood)]
+      cat(sprintf("  - Likelihood range: [%.4f, %.4f]\n",
+                  min(lik_valid), max(lik_valid)))
     }
   }
   
-  return(result)
+  # Velocity graph
+  if (!is.null(scVeloR$velocity_graph)) {
+    cat("\nVelocity graph:\n")
+    cat(sprintf("  - Graph computed: TRUE\n"))
+    cat(sprintf("  - Transition matrix: %d x %d\n",
+                nrow(scVeloR$velocity_graph$transition_matrix),
+                ncol(scVeloR$velocity_graph$transition_matrix)))
+  }
+  
+  # Velocity embedding
+  if (!is.null(scVeloR$velocity_embedding)) {
+    cat("\nVelocity embedding:\n")
+    emb_names <- names(scVeloR$velocity_embedding)
+    emb_names <- emb_names[emb_names != "current"]
+    cat(sprintf("  - Embeddings: %s\n", paste(emb_names, collapse = ", ")))
+  }
+  
+  # Latent time
+  if ("latent_time" %in% colnames(object@meta.data)) {
+    cat("\nLatent time:\n")
+    lt <- object@meta.data$latent_time
+    cat(sprintf("  - Range: [%.3f, %.3f]\n", min(lt, na.rm = TRUE), max(lt, na.rm = TRUE)))
+  }
+  
+  cat("\n")
+  invisible(NULL)
 }

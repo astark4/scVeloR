@@ -1,420 +1,272 @@
-#' @title Data Conversion and Seurat Integration
-#' @description Functions for extracting and setting velocity data in Seurat objects.
-#' Supports both Seurat V4 and V5 data structures.
+#' @title Data Conversion Functions
+#' @description Functions for converting data between Seurat objects and 
+#' scVeloR internal formats.
 #' @name data_conversion
 NULL
 
-#' Detect Seurat Version
+#' Import Velocity Data from Seurat
 #'
-#' @description Internal function to detect whether Seurat V4 or V5 is being used.
+#' @description Extract spliced and unspliced counts from Seurat object.
+#' Supports both Seurat V4 and V5 object structures.
 #'
-#' @param seurat_obj A Seurat object
-#' @return Character string "v4" or "v5"
-#' @keywords internal
-.get_seurat_version <- function(seurat_obj) {
-  if (!inherits(seurat_obj, "Seurat")) {
-    stop("Input must be a Seurat object", call. = FALSE)
-  }
-  
-  pkg_version <- utils::packageVersion("Seurat")
-  if (pkg_version >= "5.0.0") {
-    return("v5")
-  }
-  return("v4")
-}
-
-#' Check if Layer Exists
+#' @param object Seurat object
+#' @param spliced_layer Name of spliced count layer
+#' @param unspliced_layer Name of unspliced count layer
 #'
-#' @description Check if a layer/assay exists in the Seurat object.
-#'
-#' @param seurat_obj A Seurat object
-#' @param layer_name Name of the layer to check
-#' @param assay_name Name of the assay (default: NULL uses default assay)
-#' @return Logical
-#' @keywords internal
-.layer_exists <- function(seurat_obj, layer_name, assay_name = NULL) {
-  if (is.null(assay_name)) {
-    assay_name <- SeuratObject::DefaultAssay(seurat_obj)
-  }
-  
-  version <- .get_seurat_version(seurat_obj)
-  
-  if (version == "v5") {
-    # V5: Check layers
-    tryCatch({
-      layers <- SeuratObject::Layers(seurat_obj[[assay_name]])
-      return(layer_name %in% layers)
-    }, error = function(e) {
-      return(FALSE)
-    })
-  } else {
-    # V4: Check slots or separate assays
-    if (layer_name %in% c("counts", "data", "scale.data")) {
-      slot_data <- tryCatch(
-        SeuratObject::GetAssayData(seurat_obj, slot = layer_name, assay = assay_name),
-        error = function(e) NULL
-      )
-      return(!is.null(slot_data) && length(slot_data) > 0)
-    } else {
-      # Check if it's a separate assay
-      return(layer_name %in% names(seurat_obj@assays))
-    }
-  }
-}
-
-#' Get Layer Data
-#'
-#' @description Get data from a layer in the Seurat object. Works with both V4 and V5.
-#'
-#' @param seurat_obj A Seurat object
-#' @param layer_name Name of the layer
-#' @param assay_name Name of the assay (default: NULL uses default assay)
-#' @return A sparse matrix
-#' @keywords internal
-.get_layer_data <- function(seurat_obj, layer_name, assay_name = NULL) {
-  if (is.null(assay_name)) {
-    assay_name <- SeuratObject::DefaultAssay(seurat_obj)
-  }
-  
-  version <- .get_seurat_version(seurat_obj)
-  
-  if (version == "v5") {
-    # V5: Use LayerData
-    tryCatch({
-      data <- SeuratObject::LayerData(seurat_obj, layer = layer_name, assay = assay_name)
-      return(as(data, "CsparseMatrix"))
-    }, error = function(e) {
-      # Try as separate assay
-      if (layer_name %in% names(seurat_obj@assays)) {
-        return(as(SeuratObject::GetAssayData(seurat_obj, assay = layer_name), "CsparseMatrix"))
-      }
-      stop("Layer '", layer_name, "' not found", call. = FALSE)
-    })
-  } else {
-    # V4: Use GetAssayData or separate assay
-    if (layer_name %in% c("counts", "data", "scale.data")) {
-      return(as(SeuratObject::GetAssayData(seurat_obj, slot = layer_name, assay = assay_name), "CsparseMatrix"))
-    } else if (layer_name %in% names(seurat_obj@assays)) {
-      return(as(SeuratObject::GetAssayData(seurat_obj, assay = layer_name), "CsparseMatrix"))
-    } else {
-      stop("Layer '", layer_name, "' not found", call. = FALSE)
-    }
-  }
-}
-
-#' Set Layer Data
-#'
-#' @description Set data to a layer in the Seurat object. Works with both V4 and V5.
-#'
-#' @param seurat_obj A Seurat object
-#' @param layer_name Name of the layer
-#' @param data Matrix data to set
-#' @param assay_name Name of the assay (default: NULL uses default assay)
-#' @return Modified Seurat object
-#' @keywords internal
-.set_layer_data <- function(seurat_obj, layer_name, data, assay_name = NULL) {
-  if (is.null(assay_name)) {
-    assay_name <- SeuratObject::DefaultAssay(seurat_obj)
-  }
-  
-  # Ensure sparse matrix
-  if (!inherits(data, "sparseMatrix")) {
-    data <- as(data, "CsparseMatrix")
-  }
-  
-  version <- .get_seurat_version(seurat_obj)
-  
-  if (version == "v5") {
-    # V5: Use LayerData<-
-    tryCatch({
-      seurat_obj[[assay_name]] <- SeuratObject::SetAssayData(
-        seurat_obj[[assay_name]], 
-        layer = layer_name, 
-        new.data = data
-      )
-    }, error = function(e) {
-      # Create new layer if needed
-      seurat_obj[[assay_name]][[layer_name]] <- data
-    })
-  } else {
-    # V4: Use SetAssayData for standard slots, or create new assay
-    if (layer_name %in% c("counts", "data", "scale.data")) {
-      seurat_obj <- SeuratObject::SetAssayData(
-        seurat_obj, 
-        slot = layer_name, 
-        new.data = data, 
-        assay = assay_name
-      )
-    } else {
-      # Store in misc or as new assay
-      seurat_obj@misc[[layer_name]] <- data
-    }
-  }
-  
-  return(seurat_obj)
-}
-
-#' Extract Velocity Data from Seurat Object
-#'
-#' @description Extract spliced and unspliced count matrices from a Seurat object.
-#'
-#' @param seurat_obj A Seurat object containing spliced and unspliced counts
-#' @param spliced_layer Name of the spliced layer/assay (default: "spliced")
-#' @param unspliced_layer Name of the unspliced layer/assay (default: "unspliced")
-#' @param use_genes Character vector of genes to use, or NULL for all genes (default: NULL
-#'
-#' @return A list containing:
-#' \describe{
-#'   \item{spliced}{Sparse matrix of spliced counts (genes x cells)}
-#'   \item{unspliced}{Sparse matrix of unspliced counts (genes x cells)}
-#'   \item{genes}{Character vector of gene names}
-#'   \item{cells}{Character vector of cell names}
-#' }
-#'
+#' @return List with spliced and unspliced matrices
 #' @export
-#' @examples
-#' \dontrun{
-#' data <- extract_velocity_data(seurat_obj)
-#' }
-extract_velocity_data <- function(seurat_obj,
-                                   spliced_layer = "spliced",
-                                   unspliced_layer = "unspliced",
-                                   use_genes = NULL) {
+import_velocity_data <- function(object,
+                                  spliced_layer = "spliced",
+                                  unspliced_layer = "unspliced") {
   
-  # Validate input
-  if (!inherits(seurat_obj, "Seurat")) {
-    stop("Input must be a Seurat object", call. = FALSE)
-  }
+  # Detect Seurat version
+  version <- seurat_version(object)
   
-  # Try to find spliced data
-  spliced <- NULL
-  for (layer in c(spliced_layer, "counts", "data")) {
-    if (.layer_exists(seurat_obj, layer)) {
-      spliced <- .get_layer_data(seurat_obj, layer)
-      if (getOption("scVeloR.verbose", TRUE)) {
-        message("Using '", layer, "' as spliced counts")
-      }
-      break
-    }
-  }
-  
-  if (is.null(spliced)) {
-    stop("Could not find spliced counts. Please provide '", spliced_layer, "' layer.", call. = FALSE)
-  }
-  
-  # Try to find unspliced data
-  unspliced <- NULL
-  if (.layer_exists(seurat_obj, unspliced_layer)) {
-    unspliced <- .get_layer_data(seurat_obj, unspliced_layer)
+  if (version == 5) {
+    # Seurat V5
+    spliced <- tryCatch({
+      Seurat::LayerData(object, layer = spliced_layer)
+    }, error = function(e) NULL)
+    
+    unspliced <- tryCatch({
+      Seurat::LayerData(object, layer = unspliced_layer)
+    }, error = function(e) NULL)
   } else {
-    stop("Could not find unspliced counts. Please provide '", unspliced_layer, "' layer.", call. = FALSE)
+    # Seurat V4
+    assay <- Seurat::DefaultAssay(object)
+    
+    spliced <- tryCatch({
+      object@assays[[assay]]@layers[[spliced_layer]]
+    }, error = function(e) {
+      tryCatch({
+        Seurat::GetAssayData(object, slot = spliced_layer)
+      }, error = function(e2) NULL)
+    })
+    
+    unspliced <- tryCatch({
+      object@assays[[assay]]@layers[[unspliced_layer]]
+    }, error = function(e) {
+      tryCatch({
+        Seurat::GetAssayData(object, slot = unspliced_layer)
+      }, error = function(e2) NULL)
+    })
   }
   
-  # Ensure dimensions match
-  if (!all(dim(spliced) == dim(unspliced))) {
-    stop("Spliced and unspliced matrices must have the same dimensions", call. = FALSE)
+  if (is.null(spliced) || is.null(unspliced)) {
+    stop("Could not find spliced/unspliced layers. Ensure they are present in the Seurat object.")
   }
   
-  # Get gene and cell names
-  genes <- rownames(spliced)
-  cells <- colnames(spliced)
+  # Convert to dense matrices (cells x genes)
+  spliced <- as.matrix(spliced)
+  unspliced <- as.matrix(unspliced)
   
-  # Subset genes if specified
-  if (!is.null(use_genes)) {
-    use_genes <- intersect(use_genes, genes)
-    if (length(use_genes) == 0) {
-      stop("No specified genes found in the data", call. = FALSE)
-    }
-    spliced <- spliced[use_genes, , drop = FALSE]
-    unspliced <- unspliced[use_genes, , drop = FALSE]
-    genes <- use_genes
+  # Transpose if genes are in rows
+  if (nrow(spliced) != ncol(object)) {
+    spliced <- t(spliced)
+    unspliced <- t(unspliced)
   }
   
-  # Return as list
   list(
     spliced = spliced,
-    unspliced = unspliced,
-    genes = genes,
-    cells = cells
+    unspliced = unspliced
   )
 }
 
-#' Set Velocity Data to Seurat Object
+#' Create Seurat Object with Velocity Layers
 #'
-#' @description Store velocity-related data back into a Seurat object.
+#' @description Create a Seurat object with spliced and unspliced layers
+#' from count matrices.
 #'
-#' @param seurat_obj A Seurat object
-#' @param velocity Velocity matrix (genes x cells) or NULL
-#' @param velocity_u Unspliced velocity matrix or NULL
-#' @param Ms First-order moment of spliced counts or NULL
-#' @param Mu First-order moment of unspliced counts or NULL
-#' @param velocity_graph Velocity graph (sparse matrix) or NULL
-#' @param velocity_graph_neg Negative velocity graph or NULL
-#' @param velocity_embedding Velocity embedding coordinates or NULL
-#' @param fit_params Data frame of fitted parameters or NULL
+#' @param spliced Spliced count matrix (cells x genes or genes x cells)
+#' @param unspliced Unspliced count matrix
+#' @param meta.data Cell metadata (optional)
+#' @param project Project name
 #'
-#' @return Modified Seurat object
-#'
+#' @return Seurat object
 #' @export
-set_velocity_data <- function(seurat_obj,
-                               velocity = NULL,
-                               velocity_u = NULL,
-                               Ms = NULL,
-                               Mu = NULL,
-                               velocity_graph = NULL,
-                               velocity_graph_neg = NULL,
-                               velocity_embedding = NULL,
-                               fit_params = NULL) {
+create_velocity_seurat <- function(spliced,
+                                    unspliced,
+                                    meta.data = NULL,
+                                    project = "scVeloR") {
   
-  # Store velocity
-  if (!is.null(velocity)) {
-    seurat_obj <- .set_layer_data(seurat_obj, "velocity", velocity)
+  if (!requireNamespace("Seurat", quietly = TRUE)) {
+    stop("Seurat package is required")
   }
   
-  if (!is.null(velocity_u)) {
-    seurat_obj <- .set_layer_data(seurat_obj, "velocity_u", velocity_u)
-  }
-  
-  # Store moments
-  if (!is.null(Ms)) {
-    seurat_obj <- .set_layer_data(seurat_obj, "Ms", Ms)
-  }
-  
-  if (!is.null(Mu)) {
-    seurat_obj <- .set_layer_data(seurat_obj, "Mu", Mu)
-  }
-  
-  # Store velocity graph in misc
-  if (!is.null(velocity_graph)) {
-    seurat_obj@misc[["velocity_graph"]] <- velocity_graph
-  }
-  
-  if (!is.null(velocity_graph_neg)) {
-    seurat_obj@misc[["velocity_graph_neg"]] <- velocity_graph_neg
-  }
-  
-  # Store velocity embedding
-  if (!is.null(velocity_embedding)) {
-    # Store as a reduction or in misc
-    seurat_obj@misc[["velocity_embedding"]] <- velocity_embedding
-  }
-  
-  # Store fit parameters
-  if (!is.null(fit_params)) {
-    # Add to gene metadata
-    current_meta <- seurat_obj[[SeuratObject::DefaultAssay(seurat_obj)]]@meta.features
-    for (col in colnames(fit_params)) {
-      current_meta[[col]] <- fit_params[[col]][match(rownames(current_meta), rownames(fit_params))]
+  # Ensure matrices are in genes x cells format
+  if (nrow(spliced) == nrow(unspliced) && ncol(spliced) == ncol(unspliced)) {
+    # Assume genes x cells if more rows than columns
+    if (nrow(spliced) > ncol(spliced)) {
+      # Already genes x cells
+    } else {
+      # Transpose to genes x cells
+      spliced <- t(spliced)
+      unspliced <- t(unspliced)
     }
-    seurat_obj[[SeuratObject::DefaultAssay(seurat_obj)]]@meta.features <- current_meta
   }
   
-  return(seurat_obj)
+  # Create Seurat object with spliced as main counts
+  seurat_obj <- Seurat::CreateSeuratObject(
+    counts = spliced,
+    project = project,
+    meta.data = meta.data
+  )
+  
+  # Add unspliced layer
+  seurat_obj[["RNA"]]@layers$unspliced <- unspliced
+  seurat_obj[["RNA"]]@layers$spliced <- spliced
+  
+  seurat_obj
 }
 
-#' Get Embeddings from Seurat Object
+#' Export Velocity Results
 #'
-#' @description Extract embedding coordinates from a Seurat object.
+#' @description Export velocity results from Seurat object to list format.
 #'
-#' @param seurat_obj A Seurat object
-#' @param basis Name of the dimensional reduction (e.g., "umap", "tsne", "pca")
-#' @param dims Dimensions to use (default: NULL uses all)
+#' @param object Seurat object with velocity computed
 #'
-#' @return Matrix of embedding coordinates (cells x dimensions)
-#'
+#' @return List with velocity results
 #' @export
-get_embedding <- function(seurat_obj, basis = "umap", dims = NULL) {
+export_velocity_results <- function(object) {
   
-  # Handle basis name
-  if (!grepl("^[A-Za-z]", basis)) {
-    basis <- paste0("X_", basis)
-  }
-  basis <- tolower(gsub("^X_", "", basis))
-  
-  # Check if reduction exists
-  reductions <- names(seurat_obj@reductions)
-  if (!basis %in% reductions) {
-    stop("Reduction '", basis, "' not found. Available: ", paste(reductions, collapse = ", "), call. = FALSE)
+  if (is.null(object@misc$scVeloR)) {
+    stop("No scVeloR results found")
   }
   
-  # Get embeddings
-  emb <- Seurat::Embeddings(seurat_obj, reduction = basis)
+  results <- list()
   
-  # Subset dimensions if specified
-  if (!is.null(dims)) {
-    if (max(dims) > ncol(emb)) {
-      stop("Requested dimensions exceed available dimensions", call. = FALSE)
-    }
-    emb <- emb[, dims, drop = FALSE]
+  # Velocity
+  if (!is.null(object@misc$scVeloR$velocity)) {
+    results$velocity <- object@misc$scVeloR$velocity$velocity_s
+    results$gamma <- object@misc$scVeloR$velocity$gamma
+    results$r2 <- object@misc$scVeloR$velocity$r2
+    results$velocity_genes <- object@misc$scVeloR$velocity$velocity_genes
   }
   
-  return(emb)
+  # Dynamics
+  if (!is.null(object@misc$scVeloR$dynamics)) {
+    results$dynamics <- object@misc$scVeloR$dynamics$gene_params
+    results$fit_t <- object@misc$scVeloR$dynamics$fit_t
+  }
+  
+  # Velocity embedding
+  if (!is.null(object@misc$scVeloR$velocity_embedding)) {
+    results$velocity_embedding <- object@misc$scVeloR$velocity_embedding
+  }
+  
+  # Latent time
+  if ("latent_time" %in% colnames(object@meta.data)) {
+    results$latent_time <- object@meta.data$latent_time
+  }
+  
+  results
 }
 
-#' Get Variable Genes
+#' Import from AnnData
 #'
-#' @description Get highly variable genes from Seurat object.
+#' @description Import velocity data from AnnData h5ad file.
+#' Requires the anndata package.
 #'
-#' @param seurat_obj A Seurat object
-#' @param n_top Number of top variable genes to return (default: NULL returns all)
+#' @param h5ad_path Path to h5ad file
 #'
-#' @return Character vector of gene names
-#'
+#' @return Seurat object with velocity layers
 #' @export
-get_var_genes <- function(seurat_obj, n_top = NULL) {
+import_from_anndata <- function(h5ad_path) {
   
-  var_genes <- tryCatch({
-    Seurat::VariableFeatures(seurat_obj)
-  }, error = function(e) {
-    character(0)
-  })
-  
-  if (length(var_genes) == 0) {
-    warning("No variable features found. Consider running FindVariableFeatures first.")
-    return(rownames(seurat_obj))
+  if (!requireNamespace("anndata", quietly = TRUE)) {
+    stop("anndata package required. Install with: pip install anndata, then reticulate::py_install('anndata')")
   }
   
-  if (!is.null(n_top) && length(var_genes) > n_top) {
-    var_genes <- var_genes[seq_len(n_top)]
+  # Read AnnData
+  adata <- anndata::read_h5ad(h5ad_path)
+  
+  # Extract matrices
+  if ("spliced" %in% names(adata$layers)) {
+    spliced <- adata$layers[["spliced"]]
+  } else {
+    spliced <- adata$X
   }
   
-  return(var_genes)
+  if ("unspliced" %in% names(adata$layers)) {
+    unspliced <- adata$layers[["unspliced"]]
+  } else {
+    stop("No unspliced layer found in AnnData")
+  }
+  
+  # Convert to R matrices
+  spliced <- as.matrix(spliced)
+  unspliced <- as.matrix(unspliced)
+  
+  # Get metadata
+  meta_data <- as.data.frame(adata$obs)
+  
+  # Create Seurat object
+  seurat_obj <- create_velocity_seurat(
+    spliced = t(spliced),  # Transpose to genes x cells
+    unspliced = t(unspliced),
+    meta.data = meta_data
+  )
+  
+  # Import embeddings if available
+  if ("X_umap" %in% names(adata$obsm)) {
+    umap_coords <- adata$obsm[["X_umap"]]
+    colnames(umap_coords) <- paste0("UMAP_", 1:ncol(umap_coords))
+    rownames(umap_coords) <- colnames(seurat_obj)
+    
+    seurat_obj[["umap"]] <- Seurat::CreateDimReducObject(
+      embeddings = umap_coords,
+      key = "UMAP_",
+      assay = "RNA"
+    )
+  }
+  
+  seurat_obj
 }
 
-#' Show Proportions of Spliced/Unspliced Counts
+#' Export to AnnData Format
 #'
-#' @description Display the proportions of spliced and unspliced counts in the data.
+#' @description Export Seurat object with velocity to AnnData format.
 #'
-#' @param seurat_obj A Seurat object
-#' @param spliced_layer Name of the spliced layer (default: "spliced")
-#' @param unspliced_layer Name of the unspliced layer (default: "unspliced")
+#' @param object Seurat object
+#' @param filename Output h5ad filename
 #'
-#' @return Invisibly returns a named vector of proportions
-#'
+#' @return Path to saved file
 #' @export
-show_proportions <- function(seurat_obj,
-                              spliced_layer = "spliced",
-                              unspliced_layer = "unspliced") {
+export_to_anndata <- function(object, filename) {
   
-  # Extract data
-  data <- extract_velocity_data(seurat_obj, spliced_layer, unspliced_layer)
+  if (!requireNamespace("anndata", quietly = TRUE)) {
+    stop("anndata package required")
+  }
   
-  # Calculate sums per cell
-  spliced_sum <- Matrix::colSums(data$spliced)
-  unspliced_sum <- Matrix::colSums(data$unspliced)
-  total_sum <- spliced_sum + unspliced_sum
+  # Get count matrix
+  counts <- Seurat::GetAssayData(object, slot = "counts")
   
-  # Avoid division by zero
-  total_sum[total_sum == 0] <- 1
+  # Get metadata
+  obs <- object@meta.data
   
-  # Calculate proportions
-  spliced_prop <- mean(spliced_sum / total_sum)
-  unspliced_prop <- mean(unspliced_sum / total_sum)
+  # Create AnnData
+  adata <- anndata::AnnData(
+    X = t(as.matrix(counts)),
+    obs = obs
+  )
   
-  # Print results
-  message("Abundance of counts:")
-  message("  Spliced:   ", round(spliced_prop * 100, 2), "%")
-  message("  Unspliced: ", round(unspliced_prop * 100, 2), "%")
+  # Add velocity layers if present
+  if (!is.null(object@misc$scVeloR$Ms)) {
+    adata$layers[["Ms"]] <- object@misc$scVeloR$Ms
+    adata$layers[["Mu"]] <- object@misc$scVeloR$Mu
+  }
   
-  invisible(c(spliced = spliced_prop, unspliced = unspliced_prop))
+  if (!is.null(object@misc$scVeloR$velocity$velocity_s)) {
+    adata$layers[["velocity"]] <- object@misc$scVeloR$velocity$velocity_s
+  }
+  
+  # Add embeddings
+  if ("umap" %in% names(object@reductions)) {
+    adata$obsm[["X_umap"]] <- Seurat::Embeddings(object, "umap")
+  }
+  
+  # Save
+  adata$write_h5ad(filename)
+  
+  filename
 }

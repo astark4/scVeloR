@@ -1,174 +1,161 @@
-// moments.cpp - Fast moment computation
-// Author: Zaoqu Liu
-//
-// Computes first and second order moments for velocity estimation
-
-#include "scVeloR_types.h"
-
+// [[Rcpp::depends(RcppArmadillo)]]
+#include <RcppArmadillo.h>
 using namespace Rcpp;
 
-//' Compute first-order moments (weighted average) using sparse connectivity matrix
-//'
-//' @param X Sparse expression matrix (genes x cells)
-//' @param conn Sparse connectivity matrix (cells x cells), row-normalized
-//' @return Dense matrix of first-order moments (genes x cells)
+//' Compute First-Order Moments (Neighbor Averaging)
+//' 
+//' @description Compute neighbor-averaged expression values.
+//' 
+//' @param X Expression matrix (cells x genes)
+//' @param indices Neighbor indices (1-based)
+//' @param weights Neighbor weights (optional, uniform if NULL)
+//' 
+//' @return Smoothed expression matrix
 //' @keywords internal
 // [[Rcpp::export]]
-arma::mat compute_moments_sparse_cpp(const arma::sp_mat& X, 
-                                      const arma::sp_mat& conn) {
-    // Result = X * conn^T (genes x cells)
-    // conn is cells x cells, we want weighted average across neighbors
+arma::mat compute_moments_cpp(const arma::mat& X,
+                               const arma::imat& indices,
+                               const Rcpp::Nullable<arma::mat>& weights = R_NilValue) {
     
-    // conn should be row-normalized (rows sum to 1)
-    arma::mat result = X * conn.t();
+    int n_cells = X.n_rows;
+    int n_genes = X.n_cols;
+    int n_neighbors = indices.n_cols;
     
-    return result;
-}
-
-//' Compute first-order moments using dense matrices
-//'
-//' @param X Dense expression matrix (genes x cells)
-//' @param conn Dense connectivity matrix (cells x cells), row-normalized
-//' @return Dense matrix of first-order moments (genes x cells)
-//' @keywords internal
-// [[Rcpp::export]]
-NumericMatrix compute_moments_dense_cpp(const NumericMatrix& X, 
-                                         const NumericMatrix& conn) {
-    int n_genes = X.nrow();
-    int n_cells = X.ncol();
+    arma::mat M(n_cells, n_genes, arma::fill::zeros);
     
-    NumericMatrix result(n_genes, n_cells);
-    
-    // For each gene
-    for (int g = 0; g < n_genes; g++) {
-        // For each cell
-        for (int i = 0; i < n_cells; i++) {
-            double moment = 0.0;
-            // Weighted sum across all cells
-            for (int j = 0; j < n_cells; j++) {
-                double weight = conn(i, j);
-                if (weight > 0) {
-                    moment += weight * X(g, j);
-                }
-            }
-            result(g, i) = moment;
-        }
+    bool use_weights = weights.isNotNull();
+    arma::mat W;
+    if (use_weights) {
+        W = Rcpp::as<arma::mat>(weights);
     }
     
-    return result;
-}
-
-//' Compute second-order moments (X * X)
-//'
-//' @param X Sparse expression matrix (genes x cells)
-//' @param conn Sparse connectivity matrix (cells x cells), row-normalized
-//' @return Dense matrix of second-order moments (genes x cells)
-//' @keywords internal
-// [[Rcpp::export]]
-arma::mat compute_second_moments_sparse_cpp(const arma::sp_mat& X, 
-                                             const arma::sp_mat& conn) {
-    // X_sq = X .* X (element-wise square)
-    arma::sp_mat X_sq = X % X;
-    
-    // Result = X_sq * conn^T
-    arma::mat result = X_sq * conn.t();
-    
-    return result;
-}
-
-//' Compute cross-moments (U * S)
-//'
-//' @param U Sparse unspliced matrix (genes x cells)
-//' @param S Sparse spliced matrix (genes x cells)
-//' @param conn Sparse connectivity matrix (cells x cells), row-normalized
-//' @return Dense matrix of cross-moments (genes x cells)
-//' @keywords internal
-// [[Rcpp::export]]
-arma::mat compute_cross_moments_sparse_cpp(const arma::sp_mat& U, 
-                                            const arma::sp_mat& S,
-                                            const arma::sp_mat& conn) {
-    // US = U .* S (element-wise product)
-    arma::sp_mat US = U % S;
-    
-    // Result = US * conn^T
-    arma::mat result = US * conn.t();
-    
-    return result;
-}
-
-//' Compute moments for a subset of cells using indices
-//'
-//' @param X Expression matrix (genes x cells)
-//' @param neighbor_indices Matrix of neighbor indices (cells x n_neighbors), 0-based
-//' @param weights Matrix of neighbor weights (cells x n_neighbors)
-//' @return Matrix of moments (genes x cells)
-//' @keywords internal
-// [[Rcpp::export]]
-NumericMatrix compute_moments_indexed_cpp(const NumericMatrix& X,
-                                           const IntegerMatrix& neighbor_indices,
-                                           const NumericMatrix& weights) {
-    int n_genes = X.nrow();
-    int n_cells = X.ncol();
-    int n_neighbors = neighbor_indices.ncol();
-    
-    NumericMatrix result(n_genes, n_cells);
-    
-    // For each cell
     for (int i = 0; i < n_cells; i++) {
-        // For each gene
-        for (int g = 0; g < n_genes; g++) {
-            double moment = 0.0;
-            double weight_sum = 0.0;
+        double total_weight = 0.0;
+        
+        for (int k = 0; k < n_neighbors; k++) {
+            int j = indices(i, k) - 1;  // Convert to 0-based
             
-            // Average over neighbors
-            for (int k = 0; k < n_neighbors; k++) {
-                int neighbor = neighbor_indices(i, k);
-                if (neighbor >= 0 && neighbor < n_cells) {
-                    double w = weights(i, k);
-                    moment += w * X(g, neighbor);
-                    weight_sum += w;
-                }
+            if (j >= 0 && j < n_cells) {
+                double w = use_weights ? W(i, k) : 1.0;
+                M.row(i) += w * X.row(j);
+                total_weight += w;
             }
-            
-            // Normalize
-            if (weight_sum > 0) {
-                result(g, i) = moment / weight_sum;
-            } else {
-                result(g, i) = X(g, i);
-            }
+        }
+        
+        if (total_weight > 0) {
+            M.row(i) /= total_weight;
         }
     }
     
-    return result;
+    return M;
 }
 
-//' Compute connectivity-weighted row sums for normalization
-//'
-//' @param conn Sparse connectivity matrix (cells x cells)
-//' @return Vector of row sums
+//' Compute Second-Order Moments
+//' 
+//' @description Compute neighbor-averaged second-order moments:
+//' M_ss = <s^2>, M_us = <u*s>, M_uu = <u^2>
+//' 
+//' @param S Spliced expression matrix (cells x genes)
+//' @param U Unspliced expression matrix (cells x genes)
+//' @param indices Neighbor indices (1-based)
+//' @param weights Neighbor weights (optional)
+//' 
+//' @return List with Mss, Mus, Muu matrices
 //' @keywords internal
 // [[Rcpp::export]]
-arma::vec connectivity_row_sums_cpp(const arma::sp_mat& conn) {
-    return arma::vec(arma::sum(conn, 1));
-}
-
-//' Normalize connectivity matrix by row sums
-//'
-//' @param conn Sparse connectivity matrix (cells x cells)
-//' @return Row-normalized sparse connectivity matrix
-//' @keywords internal
-// [[Rcpp::export]]
-arma::sp_mat normalize_connectivity_cpp(const arma::sp_mat& conn) {
-    arma::vec row_sums = arma::vec(arma::sum(conn, 1));
+List compute_second_moments_cpp(const arma::mat& S,
+                                 const arma::mat& U,
+                                 const arma::imat& indices,
+                                 const Rcpp::Nullable<arma::mat>& weights = R_NilValue) {
     
-    // Avoid division by zero
-    row_sums.transform([](double val) { return (val > 0) ? val : 1.0; });
+    int n_cells = S.n_rows;
+    int n_genes = S.n_cols;
+    int n_neighbors = indices.n_cols;
     
-    // Create diagonal matrix for normalization
-    arma::sp_mat D_inv(conn.n_rows, conn.n_rows);
-    for (arma::uword i = 0; i < conn.n_rows; i++) {
-        D_inv(i, i) = 1.0 / row_sums(i);
+    arma::mat Mss(n_cells, n_genes, arma::fill::zeros);
+    arma::mat Mus(n_cells, n_genes, arma::fill::zeros);
+    arma::mat Muu(n_cells, n_genes, arma::fill::zeros);
+    
+    bool use_weights = weights.isNotNull();
+    arma::mat W;
+    if (use_weights) {
+        W = Rcpp::as<arma::mat>(weights);
     }
     
-    return D_inv * conn;
+    for (int i = 0; i < n_cells; i++) {
+        double total_weight = 0.0;
+        
+        for (int k = 0; k < n_neighbors; k++) {
+            int j = indices(i, k) - 1;
+            
+            if (j >= 0 && j < n_cells) {
+                double w = use_weights ? W(i, k) : 1.0;
+                
+                Mss.row(i) += w * (S.row(j) % S.row(j));  // s^2
+                Mus.row(i) += w * (U.row(j) % S.row(j));  // u*s
+                Muu.row(i) += w * (U.row(j) % U.row(j));  // u^2
+                
+                total_weight += w;
+            }
+        }
+        
+        if (total_weight > 0) {
+            Mss.row(i) /= total_weight;
+            Mus.row(i) /= total_weight;
+            Muu.row(i) /= total_weight;
+        }
+    }
+    
+    return List::create(
+        Named("Mss") = Mss,
+        Named("Mus") = Mus,
+        Named("Muu") = Muu
+    );
+}
+
+//' Row Normalize Matrix
+//' 
+//' @param X Matrix
+//' @return Row-normalized matrix
+//' @keywords internal
+// [[Rcpp::export]]
+arma::mat row_normalize_cpp(const arma::mat& X) {
+    arma::mat X_norm = X;
+    
+    for (int i = 0; i < (int)X.n_rows; i++) {
+        double row_sum = arma::accu(X.row(i));
+        if (row_sum > 0) {
+            X_norm.row(i) /= row_sum;
+        }
+    }
+    
+    return X_norm;
+}
+
+//' Sparse Matrix-Vector Multiplication
+//' 
+//' @description Multiply sparse matrix with dense vector efficiently.
+//' 
+//' @param x Sparse matrix values
+//' @param i Row indices (0-based)
+//' @param j Column indices (0-based)
+//' @param v Dense vector
+//' @param n_rows Number of rows
+//' 
+//' @return Result vector
+//' @keywords internal
+// [[Rcpp::export]]
+arma::vec sparse_matvec_cpp(const arma::vec& x,
+                             const arma::ivec& i,
+                             const arma::ivec& j,
+                             const arma::vec& v,
+                             int n_rows) {
+    
+    arma::vec result(n_rows, arma::fill::zeros);
+    
+    for (int k = 0; k < (int)x.n_elem; k++) {
+        result(i(k)) += x(k) * v(j(k));
+    }
+    
+    return result;
 }

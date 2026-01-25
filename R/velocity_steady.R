@@ -1,339 +1,258 @@
 #' @title Steady-State Velocity Model
-#' @description Functions for estimating RNA velocity using the steady-state model.
+#' @description Estimate RNA velocity using the steady-state model.
+#' The steady-state model assumes that cells are near transcriptional equilibrium:
+#' ds/dt = beta*u - gamma*s ≈ 0, which gives gamma = beta * u/s.
+#' Velocity is then computed as v = beta*u - gamma*s.
 #' @name velocity_steady
 NULL
 
-#' Fit Steady-State Velocity Model
+#' Compute Steady-State Velocity
 #'
-#' @description Estimate RNA velocity assuming cells are at steady-state equilibrium.
-#' The model fits: velocity = unspliced - gamma * spliced
+#' @description Estimate RNA velocity using linear regression on steady-state assumption.
+#' For each gene, fit gamma = u/s ratio using cells at extreme expression values.
 #'
-#' @param seurat_obj A Seurat object with computed moments (Ms, Mu)
-#' @param fit_intercept Whether to fit an intercept term (default: FALSE)
-#' @param percentile Percentile of cells to use for fitting (default: c(5, 95))
-#' @param min_r2 Minimum R-squared to consider a gene well-fit (default: 0.01)
-#' @param n_jobs Number of parallel jobs (default: 1)
-#' @param use_raw Use raw counts instead of moments (default: FALSE)
+#' @param object Seurat object with moments computed
+#' @param min_r2 Minimum R-squared for a gene to be considered a velocity gene
+#' @param perc_range Percentile range for extreme quantile fitting
+#' @param fit_offset Whether to fit intercept (for imputation model)
+#' @param use_raw Use raw counts instead of moments
+#' @param n_cores Number of cores for parallel computation
+#' @param verbose Print progress
 #'
-#' @return Modified Seurat object with velocity and fit parameters
-#'
+#' @return Seurat object with velocity in misc$scVeloR$velocity
 #' @export
-fit_velocity_steady <- function(seurat_obj,
-                                 fit_intercept = FALSE,
-                                 percentile = c(5, 95),
-                                 min_r2 = 0.01,
-                                 n_jobs = 1L,
-                                 use_raw = FALSE) {
+velocity_steady_state <- function(object,
+                                   min_r2 = 0.01,
+                                   perc_range = c(5, 95),
+                                   fit_offset = FALSE,
+                                   use_raw = FALSE,
+                                   n_cores = 1,
+                                   verbose = TRUE) {
   
-  .vmessage("Fitting steady-state velocity model")
-  
-  # Get data
-  if (use_raw) {
-    data <- extract_velocity_data(seurat_obj)
-    Ms <- data$spliced
-    Mu <- data$unspliced
-  } else {
-    # Check for moments
-    if (!.layer_exists(seurat_obj, "Ms") || !.layer_exists(seurat_obj, "Mu")) {
-      stop("Moments not found. Run compute_moments first.", call. = FALSE)
-    }
-    Ms <- .get_layer_data(seurat_obj, "Ms")
-    Mu <- .get_layer_data(seurat_obj, "Mu")
+  if (verbose) {
+    message("Computing steady-state velocity...")
   }
   
-  Ms <- make_dense(Ms)
-  Mu <- make_dense(Mu)
+  # Get expression data
+  data <- get_velocity_data(object, use_moments = !use_raw)
+  Ms <- data$Ms
+  Mu <- data$Mu
   
-  # Get genes to fit
-  genes <- rownames(Ms)
-  n_genes <- length(genes)
-  n_cells <- ncol(Ms)
+  n_cells <- nrow(Ms)
+  n_genes <- ncol(Ms)
+  gene_names <- colnames(Ms)
   
-  # Get velocity genes mask
-  velocity_genes <- get_velocity_genes_mask(seurat_obj, genes)
+  # Initialize result matrices
+  velocity <- matrix(0, n_cells, n_genes)
+  gamma <- rep(NA_real_, n_genes)
+  r2 <- rep(NA_real_, n_genes)
+  velocity_genes <- rep(FALSE, n_genes)
   
-  # Initialize results
-  gamma <- numeric(n_genes)
-  offset <- numeric(n_genes)
-  r2 <- numeric(n_genes)
-  velocity_genes_result <- rep(FALSE, n_genes)
-  
-  names(gamma) <- genes
-  names(offset) <- genes
-  names(r2) <- genes
-  names(velocity_genes_result) <- genes
+  # Percentile thresholds
+  perc_lo <- perc_range[1]
+  perc_hi <- perc_range[2]
   
   # Fit each gene
-  .vmessage("Fitting ", sum(velocity_genes), " genes...")
-  
-  genes_to_fit <- genes[velocity_genes]
-  
-  fit_gene_steady <- function(gene_idx) {
-    s <- Ms[gene_idx, ]
-    u <- Mu[gene_idx, ]
+  fit_gene <- function(i) {
+    s <- Ms[, i]
+    u <- Mu[, i]
     
-    # Filter by percentile
-    s_range <- stats::quantile(s, percentile / 100, na.rm = TRUE)
-    u_range <- stats::quantile(u, percentile / 100, na.rm = TRUE)
-    
-    mask <- (s >= s_range[1] | s <= s_range[2]) &
-            (u >= u_range[1] | u <= u_range[2])
-    
-    s_fit <- s[mask]
-    u_fit <- u[mask]
-    
-    if (length(s_fit) < 10) {
-      return(list(gamma = NA, offset = NA, r2 = 0))
+    # Skip if too few non-zero values
+    valid <- (s > 0) & (u > 0)
+    if (sum(valid) < 10) {
+      return(list(gamma = NA, r2 = NA, v = rep(0, n_cells)))
     }
     
-    # Fit linear model
-    if (fit_intercept) {
-      fit <- tryCatch({
-        model <- stats::lm(u_fit ~ s_fit)
-        coefs <- stats::coef(model)
-        list(
-          gamma = unname(coefs[2]),
-          offset = unname(coefs[1])
-        )
-      }, error = function(e) {
-        list(gamma = NA, offset = NA)
-      })
+    s_valid <- s[valid]
+    u_valid <- u[valid]
+    
+    # Use extreme quantiles for fitting
+    s_lo <- quantile(s_valid, perc_lo / 100)
+    s_hi <- quantile(s_valid, perc_hi / 100)
+    
+    extreme <- (s_valid <= s_lo) | (s_valid >= s_hi)
+    
+    if (sum(extreme) < 10) {
+      extreme <- rep(TRUE, length(s_valid))
+    }
+    
+    s_fit <- s_valid[extreme]
+    u_fit <- u_valid[extreme]
+    
+    # Linear regression: u = gamma * s + offset
+    # (with or without offset)
+    if (fit_offset) {
+      fit <- lm(u_fit ~ s_fit)
+      gamma_i <- coef(fit)[2]
+      offset_i <- coef(fit)[1]
+      
+      u_pred <- gamma_i * s_fit + offset_i
     } else {
-      # No intercept: gamma = sum(s*u) / sum(s^2)
-      ss <- sum(s_fit^2)
-      if (ss > 0) {
-        fit <- list(
-          gamma = sum(s_fit * u_fit) / ss,
-          offset = 0
-        )
-      } else {
-        fit <- list(gamma = NA, offset = 0)
-      }
+      # Regression through origin: gamma = sum(u*s) / sum(s^2)
+      gamma_i <- sum(u_fit * s_fit) / sum(s_fit^2)
+      offset_i <- 0
+      
+      u_pred <- gamma_i * s_fit
     }
     
-    # Calculate R-squared
-    if (!is.na(fit$gamma)) {
-      predicted <- fit$gamma * s + fit$offset
-      residual <- u - predicted
-      ss_res <- sum(residual^2)
-      ss_tot <- sum((u - mean(u))^2)
-      r2_val <- ifelse(ss_tot > 0, 1 - ss_res / ss_tot, 0)
-    } else {
-      r2_val <- 0
+    # R-squared
+    ss_res <- sum((u_fit - u_pred)^2)
+    ss_tot <- sum((u_fit - mean(u_fit))^2)
+    r2_i <- 1 - ss_res / max(ss_tot, 1e-10)
+    
+    # Ensure gamma is positive
+    if (!is.finite(gamma_i) || gamma_i <= 0) {
+      return(list(gamma = NA, r2 = NA, v = rep(0, n_cells)))
     }
     
-    list(gamma = fit$gamma, offset = fit$offset, r2 = r2_val)
+    # Compute velocity: v = u - gamma * s
+    # (note: this is proportional to ds/dt since ds/dt = beta*u - gamma*s,
+    # and we assume beta = 1 or absorb it into the ratio)
+    v <- u - gamma_i * s
+    
+    list(gamma = gamma_i, r2 = r2_i, v = v)
   }
   
   # Run fitting
-  results <- apply_with_progress(
-    seq_len(n_genes),
-    fit_gene_steady,
-    n_jobs = n_jobs,
-    show_progress = TRUE
-  )
+  if (n_cores > 1 && requireNamespace("parallel", quietly = TRUE)) {
+    results <- parallel::mclapply(seq_len(n_genes), fit_gene, mc.cores = n_cores)
+  } else {
+    results <- lapply(seq_len(n_genes), function(i) {
+      if (verbose && i %% 1000 == 0) {
+        message(sprintf("  Fitted %d/%d genes", i, n_genes))
+      }
+      fit_gene(i)
+    })
+  }
   
-  # Extract results
+  # Collect results
   for (i in seq_len(n_genes)) {
-    if (!is.null(results[[i]])) {
-      gamma[i] <- results[[i]]$gamma
-      offset[i] <- results[[i]]$offset
-      r2[i] <- results[[i]]$r2
-      velocity_genes_result[i] <- velocity_genes[i] && 
-                                   !is.na(gamma[i]) && 
-                                   gamma[i] > 0 &&
-                                   r2[i] >= min_r2
+    res <- results[[i]]
+    gamma[i] <- res$gamma
+    r2[i] <- res$r2
+    velocity[, i] <- res$v
+    
+    if (!is.na(res$r2) && res$r2 >= min_r2) {
+      velocity_genes[i] <- TRUE
     }
   }
   
-  # Calculate velocity: v = u - gamma * s
-  .vmessage("Computing velocity...")
+  colnames(velocity) <- gene_names
+  rownames(velocity) <- rownames(Ms)
+  names(gamma) <- gene_names
+  names(r2) <- gene_names
+  names(velocity_genes) <- gene_names
   
-  velocity <- Mu - sweep(Ms, 1, gamma, "*")
-  if (fit_intercept) {
-    velocity <- velocity - offset
+  n_velocity_genes <- sum(velocity_genes)
+  
+  if (verbose) {
+    message(sprintf("  Found %d velocity genes (R² >= %.2f)", n_velocity_genes, min_r2))
   }
-  
-  # Set non-velocity genes to NA
-  velocity[!velocity_genes_result, ] <- NA
   
   # Store results
-  velocity <- as(velocity, "CsparseMatrix")
-  rownames(velocity) <- genes
-  colnames(velocity) <- colnames(Ms)
+  if (is.null(object@misc$scVeloR)) {
+    object@misc$scVeloR <- list()
+  }
   
-  seurat_obj <- .set_layer_data(seurat_obj, "velocity", velocity)
-  
-  # Store fit parameters
-  fit_params <- data.frame(
-    row.names = genes,
-    fit_gamma = gamma,
-    fit_offset = offset,
-    fit_r2 = r2,
-    velocity_genes = velocity_genes_result
+  object@misc$scVeloR$velocity <- list(
+    velocity_s = velocity,
+    gamma = gamma,
+    r2 = r2,
+    velocity_genes = which(velocity_genes),
+    mode = "steady_state",
+    min_r2 = min_r2
   )
   
-  seurat_obj <- store_fit_params(seurat_obj, fit_params)
-  seurat_obj@misc$velocity_mode <- "steady_state"
-  
-  n_fit <- sum(velocity_genes_result, na.rm = TRUE)
-  .vmessage("Fitted ", n_fit, " velocity genes")
-  
-  return(seurat_obj)
-}
-
-#' Get Velocity Genes Mask
-#'
-#' @description Get boolean mask for velocity genes.
-#'
-#' @param seurat_obj Seurat object
-#' @param genes Gene names
-#' @return Logical vector
-#' @keywords internal
-get_velocity_genes_mask <- function(seurat_obj, genes) {
-  
-  # Try to get from misc first
-  if (!is.null(seurat_obj@misc$velocity_genes)) {
-    vg <- seurat_obj@misc$velocity_genes
-    if (is.logical(vg)) {
-      if (length(vg) == length(genes)) {
-        return(vg)
-      }
-    } else if (!is.null(names(vg))) {
-      return(genes %in% names(vg)[vg])
-    }
+  if (verbose) {
+    message("Done. Velocity stored in object@misc$scVeloR$velocity")
   }
   
-  # Try from assay metadata
-  assay_name <- SeuratObject::DefaultAssay(seurat_obj)
-  tryCatch({
-    meta <- seurat_obj[[assay_name]]@meta.features
-    if ("velocity_genes" %in% colnames(meta)) {
-      return(meta$velocity_genes[match(genes, rownames(meta))])
-    }
-  }, error = function(e) NULL)
-  
-  # Default: all genes
-  rep(TRUE, length(genes))
+  object
 }
 
-#' Store Fit Parameters
+#' Rank Velocity Genes
 #'
-#' @description Store velocity fit parameters in Seurat object.
+#' @description Rank genes by velocity fit quality (R-squared).
 #'
-#' @param seurat_obj Seurat object
-#' @param fit_params Data frame of fit parameters
-#' @return Modified Seurat object
-#' @keywords internal
-store_fit_params <- function(seurat_obj, fit_params) {
-  
-  assay_name <- SeuratObject::DefaultAssay(seurat_obj)
-  
-  tryCatch({
-    meta <- seurat_obj[[assay_name]]@meta.features
-    
-    for (col in colnames(fit_params)) {
-      idx <- match(rownames(fit_params), rownames(meta))
-      meta[[col]] <- NA
-      meta[[col]][idx[!is.na(idx)]] <- fit_params[[col]][!is.na(idx)]
-    }
-    
-    seurat_obj[[assay_name]]@meta.features <- meta
-  }, error = function(e) {
-    # Store in misc as fallback
-    seurat_obj@misc$fit_params <- fit_params
-  })
-  
-  return(seurat_obj)
-}
-
-#' Identify Velocity Genes
+#' @param object Seurat object with velocity computed
+#' @param n_top Number of top genes to return
+#' @param groupby Optional grouping variable
 #'
-#' @description Identify genes suitable for velocity analysis based on fit quality.
-#'
-#' @param seurat_obj A Seurat object with fitted velocity
-#' @param min_r2 Minimum R-squared (default: 0.01)
-#' @param min_corr Minimum correlation (default: 0.3)
-#' @param min_ratio Minimum unspliced/spliced ratio (default: 0.1)
-#' @param n_top_genes Number of top genes to select (default: NULL for all passing)
-#'
-#' @return Character vector of velocity gene names
-#'
+#' @return Data frame with ranked genes
 #' @export
-velocity_genes <- function(seurat_obj,
-                            min_r2 = 0.01,
-                            min_corr = 0.3,
-                            min_ratio = 0.1,
-                            n_top_genes = NULL) {
+rank_velocity_genes <- function(object,
+                                n_top = 100,
+                                groupby = NULL) {
   
-  # Get fit parameters
-  fit_params <- get_fit_params(seurat_obj)
-  
-  if (is.null(fit_params)) {
-    stop("Fit parameters not found. Run velocity estimation first.", call. = FALSE)
+  if (is.null(object@misc$scVeloR$velocity)) {
+    stop("Run velocity() first")
   }
   
-  genes <- rownames(fit_params)
+  r2 <- object@misc$scVeloR$velocity$r2
   
-  # Apply filters
-  mask <- rep(TRUE, nrow(fit_params))
+  # Remove NA values
+  valid <- !is.na(r2)
+  r2_valid <- r2[valid]
+  gene_names <- names(r2)[valid]
   
-  if ("fit_r2" %in% colnames(fit_params)) {
-    mask <- mask & !is.na(fit_params$fit_r2) & (fit_params$fit_r2 >= min_r2)
-  }
+  # Sort by R2
+  order_idx <- order(r2_valid, decreasing = TRUE)
   
-  if ("fit_gamma" %in% colnames(fit_params)) {
-    mask <- mask & !is.na(fit_params$fit_gamma) & (fit_params$fit_gamma > 0)
-  }
+  n_return <- min(n_top, length(order_idx))
   
-  if ("velocity_genes" %in% colnames(fit_params)) {
-    mask <- mask & fit_params$velocity_genes
-  }
-  
-  velocity_genes <- genes[mask]
-  
-  # Select top genes if specified
-  if (!is.null(n_top_genes) && length(velocity_genes) > n_top_genes) {
-    r2_vals <- fit_params$fit_r2[mask]
-    order_idx <- order(r2_vals, decreasing = TRUE)
-    velocity_genes <- velocity_genes[order_idx[seq_len(n_top_genes)]]
-  }
-  
-  .vmessage("Selected ", length(velocity_genes), " velocity genes")
-  
-  return(velocity_genes)
+  data.frame(
+    gene = gene_names[order_idx[1:n_return]],
+    r2 = r2_valid[order_idx[1:n_return]],
+    rank = 1:n_return,
+    stringsAsFactors = FALSE
+  )
 }
 
-#' Get Fit Parameters
+#' Test Velocity Gene Bimodality
 #'
-#' @description Get velocity fit parameters from Seurat object.
+#' @description Test whether a gene shows bimodal expression distribution,
+#' which may indicate that it has both inducing and repressing populations.
 #'
-#' @param seurat_obj Seurat object
-#' @return Data frame of fit parameters or NULL
+#' @param object Seurat object
+#' @param gene Gene name
+#'
+#' @return List with test results
 #' @keywords internal
-get_fit_params <- function(seurat_obj) {
+test_bimodality <- function(object, gene) {
   
-  # Try misc first
-  if (!is.null(seurat_obj@misc$fit_params)) {
-    return(seurat_obj@misc$fit_params)
+  data <- get_velocity_data(object)
+  Ms <- data$Ms
+  Mu <- data$Mu
+  
+  gene_idx <- which(colnames(Ms) == gene)
+  
+  if (length(gene_idx) == 0) {
+    return(list(pval = 1, bimodal = FALSE))
   }
   
-  # Try assay meta features
-  assay_name <- SeuratObject::DefaultAssay(seurat_obj)
+  s <- Ms[, gene_idx]
+  u <- Mu[, gene_idx]
   
-  tryCatch({
-    meta <- seurat_obj[[assay_name]]@meta.features
-    
-    fit_cols <- c("fit_gamma", "fit_offset", "fit_r2", "velocity_genes",
-                  "fit_alpha", "fit_beta", "fit_t_", "fit_scaling",
-                  "fit_likelihood", "fit_alignment")
-    
-    available_cols <- intersect(fit_cols, colnames(meta))
-    
-    if (length(available_cols) > 0) {
-      return(meta[, available_cols, drop = FALSE])
-    }
-    
-    NULL
-  }, error = function(e) NULL)
+  # Use kernel density estimation
+  if (sum(s > 0) < 20) {
+    return(list(pval = 1, bimodal = FALSE))
+  }
+  
+  s_pos <- s[s > 0]
+  
+  # Estimate density
+  dens <- density(s_pos, n = 512)
+  
+  # Find local maxima
+  d_diff <- diff(dens$y)
+  local_max <- which(d_diff[-length(d_diff)] > 0 & d_diff[-1] < 0) + 1
+  
+  # Bimodal if two or more significant peaks
+  bimodal <- length(local_max) >= 2
+  
+  list(
+    pval = if (bimodal) 0.01 else 1,
+    bimodal = bimodal,
+    n_peaks = length(local_max)
+  )
 }

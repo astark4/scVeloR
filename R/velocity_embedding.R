@@ -1,281 +1,501 @@
 #' @title Velocity Embedding Projection
-#' @description Functions for projecting velocities onto low-dimensional embeddings.
+#' @description Project velocity vectors onto low-dimensional embeddings (UMAP, tSNE, etc.).
 #' @name velocity_embedding
 NULL
 
-#' Project Velocity to Embedding
+#' Project Velocity onto Embedding
 #'
-#' @description Project high-dimensional velocity vectors onto a 2D embedding space.
+#' @description Project high-dimensional velocity vectors onto 2D/3D embeddings
+#' using the velocity graph transition matrix.
 #'
-#' @param seurat_obj A Seurat object with computed velocity graph
-#' @param basis Name of the embedding to use (default: "umap")
-#' @param vkey Key for velocity layer (default: "velocity")
-#' @param scale Scale factor for velocity arrows (default: 10)
-#' @param self_transitions Include self-transitions (default: TRUE)
-#' @param use_negative Use negative correlations (default: FALSE)
-#' @param autoscale Auto-scale velocities per cell (default: TRUE)
-#' @param all_comps Use all embedding components (default: FALSE)
-#' @param direct_pca Use direct PCA projection (default: FALSE)
-#' @param n_pcs Number of PCs for direct projection (default: 30)
+#' @param object Seurat object with velocity computed
+#' @param embedding_name Name of embedding to use (e.g., "umap", "tsne")
+#' @param sigma Kernel bandwidth for transition smoothing
+#' @param scale Scale factor for arrow lengths
+#' @param direct Use direct projection instead of transition-based
+#' @param autoscale Automatically scale velocities
+#' @param verbose Print progress
 #'
-#' @return Modified Seurat object with velocity_embedding in misc
-#'
+#' @return Seurat object with velocity_embedding in misc$scVeloR
 #' @export
-project_velocity_embedding <- function(seurat_obj,
-                                         basis = "umap",
-                                         vkey = "velocity",
-                                         scale = 10,
-                                         self_transitions = TRUE,
-                                         use_negative = FALSE,
-                                         autoscale = TRUE,
-                                         all_comps = FALSE,
-                                         direct_pca = FALSE,
-                                         n_pcs = 30) {
+velocity_embedding <- function(object,
+                                embedding_name = "umap",
+                                sigma = 0.05,
+                                scale = 1,
+                                direct = FALSE,
+                                autoscale = TRUE,
+                                verbose = TRUE) {
   
-  .vmessage("Projecting velocity to ", basis, " embedding")
+  if (is.null(object@misc$scVeloR$velocity$velocity_s)) {
+    stop("Run velocity() first")
+  }
   
-  # Get embedding
-  emb <- get_embedding(seurat_obj, basis)
-  n_cells <- nrow(emb)
-  n_dims <- ifelse(all_comps, ncol(emb), min(2, ncol(emb)))
+  if (verbose) {
+    message("Projecting velocity onto embedding...")
+  }
   
-  # Initialize velocity embedding
-  V_emb <- matrix(0, nrow = n_cells, ncol = n_dims)
-  rownames(V_emb) <- rownames(emb)
-  colnames(V_emb) <- paste0("V_", colnames(emb)[seq_len(n_dims)])
+  # Get embedding coordinates
+  embedding <- get_embedding(object, embedding_name)
   
-  if (direct_pca) {
-    # Direct projection via PCA loadings
-    V_emb <- project_velocity_pca(seurat_obj, basis, vkey, n_pcs, n_dims)
+  if (is.null(embedding)) {
+    stop(sprintf("Embedding '%s' not found", embedding_name))
+  }
+  
+  n_cells <- nrow(embedding)
+  n_dims <- ncol(embedding)
+  
+  if (direct) {
+    # Direct projection method
+    velocity_embedded <- project_velocity_direct(
+      object = object,
+      embedding = embedding,
+      verbose = verbose
+    )
   } else {
-    # Projection via transition matrix
-    validate_seurat(seurat_obj, require_graph = TRUE)
-    
+    # Transition matrix-based projection
     # Get transition matrix
-    T_mat <- transition_matrix(seurat_obj, 
-                                scale = scale, 
-                                self_transitions = self_transitions,
-                                use_negative = use_negative)
+    T <- NULL
     
-    # Project: V_emb = T * emb - emb
-    emb_subset <- emb[, seq_len(n_dims), drop = FALSE]
-    V_emb <- as.matrix(T_mat %*% emb_subset) - emb_subset
+    if (!is.null(object@misc$scVeloR$velocity$transition_matrix)) {
+      T <- object@misc$scVeloR$velocity$transition_matrix
+    } else if (!is.null(object@misc$scVeloR$velocity_graph$transition_matrix)) {
+      T <- object@misc$scVeloR$velocity_graph$transition_matrix
+    }
+    
+    if (is.null(T)) {
+      # Build velocity graph first
+      object <- velocity_graph(object, verbose = FALSE)
+      T <- object@misc$scVeloR$velocity_graph$transition_matrix
+    }
+    
+    velocity_embedded <- project_velocity_transition(
+      embedding = embedding,
+      transition_matrix = T,
+      sigma = sigma
+    )
   }
   
-  # Autoscale
+  # Scale velocities
   if (autoscale) {
-    V_emb <- autoscale_velocity_embedding(V_emb, scale)
-  }
-  
-  # Store result
-  seurat_obj@misc$velocity_embedding <- V_emb
-  seurat_obj@misc$velocity_embedding_params <- list(
-    basis = basis,
-    scale = scale,
-    autoscale = autoscale,
-    direct_pca = direct_pca
-  )
-  
-  .vmessage("Velocity embedding computed")
-  
-  return(seurat_obj)
-}
-
-#' Get Velocity Embedding
-#'
-#' @description Extract velocity embedding from Seurat object.
-#'
-#' @param seurat_obj A Seurat object
-#' @return Matrix of velocity embedding coordinates
-#'
-#' @export
-get_velocity_embedding <- function(seurat_obj) {
-  V_emb <- seurat_obj@misc$velocity_embedding
-  
-  if (is.null(V_emb)) {
-    stop("Velocity embedding not found. Run project_velocity_embedding first.", call. = FALSE)
-  }
-  
-  return(V_emb)
-}
-
-#' Autoscale Velocity Embedding
-#'
-#' @description Scale velocity vectors to have consistent magnitudes.
-#'
-#' @param V_emb Velocity embedding matrix
-#' @param scale Overall scale factor
-#' @return Scaled velocity embedding
-#' @keywords internal
-autoscale_velocity_embedding <- function(V_emb, scale = 10) {
-  # Compute magnitudes
-  mags <- sqrt(rowSums(V_emb^2))
-  
-  # Scale to median magnitude
-  median_mag <- stats::median(mags[mags > 0])
-  if (median_mag > 0) {
-    V_emb <- V_emb / median_mag
-  }
-  
-  # Apply overall scale
-  V_emb <- V_emb / scale
-  
-  return(V_emb)
-}
-
-#' Project Velocity via PCA
-#'
-#' @description Direct projection of velocity to embedding via PCA loadings.
-#'
-#' @param seurat_obj Seurat object
-#' @param basis Embedding name
-#' @param vkey Velocity key
-#' @param n_pcs Number of PCs
-#' @param n_dims Output dimensions
-#' @return Velocity embedding matrix
-#' @keywords internal
-project_velocity_pca <- function(seurat_obj, basis, vkey, n_pcs, n_dims) {
-  
-  # Get velocity
-  V <- get_velocity(seurat_obj, remove_na = TRUE)
-  
-  # Get PCA loadings
-  if (!"pca" %in% names(seurat_obj@reductions)) {
-    stop("PCA not found. Run RunPCA first.", call. = FALSE)
-  }
-  
-  pca_loadings <- Seurat::Loadings(seurat_obj, "pca")
-  
-  # Subset to common genes
-  common_genes <- intersect(rownames(V), rownames(pca_loadings))
-  V <- V[common_genes, , drop = FALSE]
-  pca_loadings <- pca_loadings[common_genes, , drop = FALSE]
-  
-  # Limit PCs
-  n_pcs <- min(n_pcs, ncol(pca_loadings))
-  pca_loadings <- pca_loadings[, seq_len(n_pcs), drop = FALSE]
-  
-  # Project velocity to PCA space: V_pca = t(V) %*% loadings
-  V_pca <- t(make_dense(V)) %*% pca_loadings
-  
-  # Get embedding
-  emb <- get_embedding(seurat_obj, basis)
-  n_dims <- min(n_dims, ncol(emb))
-  
-  # If embedding is UMAP from PCA, we need to project further
-  # For simplicity, we use the first n_dims of V_pca
-  if (basis == "umap" && ncol(V_pca) >= n_dims) {
-    # Use correlation with embedding to estimate projection
-    V_emb <- matrix(0, nrow = nrow(V_pca), ncol = n_dims)
+    # Scale by median displacement
+    embedding_diffs <- diff(as.matrix(embedding[order(object@meta.data$latent_time %||% 1:n_cells), ]))
+    median_displacement <- median(sqrt(rowSums(embedding_diffs^2)))
     
-    for (i in seq_len(n_dims)) {
-      # Find PC dimensions most correlated with this embedding dimension
-      cors <- apply(V_pca, 2, function(x) stats::cor(x, emb[, i], use = "complete.obs"))
-      best_pcs <- order(abs(cors), decreasing = TRUE)[1:min(5, n_pcs)]
-      
-      # Weighted combination
-      weights <- cors[best_pcs]
-      weights <- weights / sum(abs(weights))
-      V_emb[, i] <- V_pca[, best_pcs, drop = FALSE] %*% weights
+    velocity_norms <- sqrt(rowSums(velocity_embedded^2))
+    median_velocity <- median(velocity_norms[velocity_norms > 0])
+    
+    if (median_velocity > 0 && is.finite(median_velocity)) {
+      scale_factor <- median_displacement / median_velocity * scale
+      velocity_embedded <- velocity_embedded * scale_factor
     }
   } else {
-    V_emb <- V_pca[, seq_len(n_dims), drop = FALSE]
+    velocity_embedded <- velocity_embedded * scale
   }
   
-  rownames(V_emb) <- colnames(seurat_obj)
-  colnames(V_emb) <- paste0("V_", seq_len(n_dims))
-  
-  return(V_emb)
-}
-
-#' Compute Velocity Magnitude
-#'
-#' @description Compute the magnitude of velocity vectors.
-#'
-#' @param seurat_obj A Seurat object
-#' @param use_embedding Use embedding-projected velocities (default: TRUE)
-#'
-#' @return Numeric vector of velocity magnitudes
-#'
-#' @export
-velocity_magnitude <- function(seurat_obj, use_embedding = TRUE) {
-  if (use_embedding) {
-    V <- get_velocity_embedding(seurat_obj)
-  } else {
-    V <- get_velocity(seurat_obj)
-    V <- t(make_dense(V))
+  # Store results
+  if (is.null(object@misc$scVeloR$velocity_embedding)) {
+    object@misc$scVeloR$velocity_embedding <- list()
   }
   
-  mags <- sqrt(rowSums(V^2))
-  names(mags) <- rownames(V)
+  colnames(velocity_embedded) <- paste0("V", 1:n_dims)
+  rownames(velocity_embedded) <- rownames(embedding)
   
-  return(mags)
+  object@misc$scVeloR$velocity_embedding[[embedding_name]] <- velocity_embedded
+  object@misc$scVeloR$velocity_embedding$current <- embedding_name
+  
+  if (verbose) {
+    message(sprintf("Done. Velocity embedding stored for '%s'", embedding_name))
+  }
+  
+  object
 }
 
-#' Compute Velocity Confidence
+#' Project Velocity Using Transition Matrix
 #'
-#' @description Compute confidence scores for velocity estimates.
+#' @description Project velocity using the transition probability matrix.
+#' For each cell, the velocity is the expected displacement based on transition probabilities.
 #'
-#' @param seurat_obj A Seurat object with velocity graph
-#' @param vkey Velocity key
-#' @param n_neighbors Number of neighbors
+#' @param embedding Embedding coordinates
+#' @param transition_matrix Transition probability matrix
+#' @param sigma Kernel bandwidth
 #'
-#' @return Seurat object with confidence scores in metadata
-#'
-#' @export
-velocity_confidence <- function(seurat_obj, vkey = "velocity", n_neighbors = NULL) {
+#' @return Matrix of velocity vectors (n_cells x n_dims)
+#' @keywords internal
+project_velocity_transition <- function(embedding,
+                                         transition_matrix,
+                                         sigma = 0.05) {
   
-  .vmessage("Computing velocity confidence")
+  n_cells <- nrow(embedding)
+  n_dims <- ncol(embedding)
   
-  # Get velocity graph
-  graph <- get_velocity_graph(seurat_obj, negative = FALSE)
-  graph_neg <- get_velocity_graph(seurat_obj, negative = TRUE)
+  velocity_embedded <- matrix(0, n_cells, n_dims)
   
-  # Confidence based on positive vs negative correlations
-  pos_sum <- Matrix::rowSums(graph)
-  neg_sum <- Matrix::rowSums(graph_neg)
-  total_sum <- pos_sum + neg_sum
+  # Make transition matrix sparse if not already
+  if (!inherits(transition_matrix, "sparseMatrix")) {
+    transition_matrix <- as(transition_matrix, "sparseMatrix")
+  }
   
-  # Avoid division by zero
-  total_sum[total_sum == 0] <- 1
+  # Get current cell positions
+  X <- as.matrix(embedding)
   
-  # Confidence = (positive - negative) / total
-  confidence <- (pos_sum - neg_sum) / total_sum
+  # For each cell, compute expected displacement
+  for (i in seq_len(n_cells)) {
+    # Get transition probabilities to neighbors
+    probs <- transition_matrix[i, ]
+    
+    # Find non-zero transitions
+    nonzero <- which(probs > 0)
+    
+    if (length(nonzero) == 0) next
+    
+    # Get neighbor positions
+    X_neighbors <- X[nonzero, , drop = FALSE]
+    p_neighbors <- probs[nonzero]
+    
+    # Remove self-transition if present
+    if (i %in% nonzero) {
+      self_idx <- which(nonzero == i)
+      X_neighbors <- X_neighbors[-self_idx, , drop = FALSE]
+      p_neighbors <- p_neighbors[-self_idx]
+    }
+    
+    if (length(p_neighbors) == 0 || sum(p_neighbors) == 0) next
+    
+    # Normalize probabilities
+    p_neighbors <- p_neighbors / sum(p_neighbors)
+    
+    # Compute displacements
+    dX <- X_neighbors - matrix(X[i, ], nrow = nrow(X_neighbors), ncol = n_dims, byrow = TRUE)
+    
+    # Weight by probability
+    velocity_embedded[i, ] <- colSums(dX * p_neighbors)
+  }
   
-  # Coherence = max correlation
-  coherence <- apply(graph, 1, function(x) {
-    if (all(x == 0)) return(0)
-    max(x)
-  })
-  
-  # Store in metadata
-  seurat_obj@meta.data$velocity_confidence <- confidence
-  seurat_obj@meta.data$velocity_coherence <- coherence
-  
-  .vmessage("Added velocity_confidence and velocity_coherence to metadata")
-  
-  return(seurat_obj)
+  velocity_embedded
 }
 
-#' Compute Cell Velocity Length
+#' Direct Velocity Projection
 #'
-#' @description Compute the expected velocity length (transition distance).
+#' @description Project velocity directly using correlation-based method.
 #'
-#' @param seurat_obj A Seurat object
-#' @param vkey Velocity key
-#' @param basis Embedding basis
+#' @param object Seurat object
+#' @param embedding Embedding coordinates
+#' @param verbose Print progress
 #'
-#' @return Numeric vector of velocity lengths
+#' @return Matrix of velocity vectors
+#' @keywords internal
+project_velocity_direct <- function(object,
+                                     embedding,
+                                     verbose = FALSE) {
+  
+  # Get expression and velocity data
+  data <- get_velocity_data(object)
+  Ms <- data$Ms
+  
+  velocity <- object@misc$scVeloR$velocity$velocity_s
+  velocity_genes <- object@misc$scVeloR$velocity$velocity_genes
+  
+  Ms <- Ms[, velocity_genes, drop = FALSE]
+  velocity <- velocity[, velocity_genes, drop = FALSE]
+  
+  n_cells <- nrow(Ms)
+  n_dims <- ncol(embedding)
+  
+  velocity_embedded <- matrix(0, n_cells, n_dims)
+  
+  # Get neighbors
+  if (!is.null(object@misc$scVeloR$neighbors)) {
+    indices <- object@misc$scVeloR$neighbors$indices
+    
+    for (i in seq_len(n_cells)) {
+      v <- velocity[i, ]
+      v_norm <- sqrt(sum(v^2))
+      
+      if (v_norm == 0 || !is.finite(v_norm)) next
+      
+      neighbors <- indices[i, ]
+      neighbors <- neighbors[neighbors > 0 & neighbors <= n_cells & neighbors != i]
+      
+      if (length(neighbors) == 0) next
+      
+      # Compute correlations with displacements
+      correlations <- numeric(length(neighbors))
+      displacements <- matrix(0, length(neighbors), n_dims)
+      
+      for (k in seq_along(neighbors)) {
+        j <- neighbors[k]
+        
+        # Expression displacement
+        dx <- Ms[j, ] - Ms[i, ]
+        dx_norm <- sqrt(sum(dx^2))
+        
+        if (dx_norm > 0 && is.finite(dx_norm)) {
+          correlations[k] <- sum(v * dx) / (v_norm * dx_norm)
+        }
+        
+        # Embedding displacement
+        displacements[k, ] <- embedding[j, ] - embedding[i, ]
+      }
+      
+      # Weight displacements by positive correlations
+      pos_corr <- pmax(correlations, 0)
+      
+      if (sum(pos_corr) > 0) {
+        weights <- pos_corr / sum(pos_corr)
+        velocity_embedded[i, ] <- colSums(displacements * weights)
+      }
+    }
+  }
+  
+  velocity_embedded
+}
+
+#' Get Embedding from Seurat Object
 #'
+#' @description Extract embedding coordinates from Seurat object.
+#'
+#' @param object Seurat object
+#' @param embedding_name Name of embedding
+#'
+#' @return Embedding matrix (cells x dims)
+#' @keywords internal
+get_embedding <- function(object, embedding_name = "umap") {
+  
+  # Try to find the embedding
+  reduction_name <- tolower(embedding_name)
+  
+  if (reduction_name %in% names(object@reductions)) {
+    emb <- Seurat::Embeddings(object, reduction = reduction_name)
+    return(as.matrix(emb))
+  }
+  
+  # Try common variations
+  alternatives <- c(
+    embedding_name,
+    tolower(embedding_name),
+    toupper(embedding_name),
+    paste0(embedding_name, "_"),
+    paste0("X_", embedding_name)
+  )
+  
+  for (alt in alternatives) {
+    if (alt %in% names(object@reductions)) {
+      emb <- Seurat::Embeddings(object, reduction = alt)
+      return(as.matrix(emb))
+    }
+  }
+  
+  # Not found
+  NULL
+}
+
+#' Compute Grid Velocity Embedding
+#'
+#' @description Compute velocity vectors on a regular grid for visualization.
+#'
+#' @param object Seurat object with velocity embedding
+#' @param embedding_name Name of embedding
+#' @param n_grid Number of grid points per dimension
+#' @param min_cells Minimum cells per grid point
+#' @param smooth Smoothing factor
+#'
+#' @return List with grid coordinates and velocities
 #' @export
-velocity_length <- function(seurat_obj, vkey = "velocity", basis = "umap") {
+velocity_grid <- function(object,
+                          embedding_name = "umap",
+                          n_grid = 50,
+                          min_cells = 5,
+                          smooth = 0.5) {
+  
+  # Get embedding
+  embedding <- get_embedding(object, embedding_name)
+  
+  if (is.null(embedding)) {
+    stop(sprintf("Embedding '%s' not found", embedding_name))
+  }
   
   # Get velocity embedding
-  V_emb <- get_velocity_embedding(seurat_obj)
+  if (is.null(object@misc$scVeloR$velocity_embedding[[embedding_name]])) {
+    stop("Run velocity_embedding() first")
+  }
   
-  # Compute lengths
-  lengths <- sqrt(rowSums(V_emb^2))
-  names(lengths) <- rownames(V_emb)
+  velocity <- object@misc$scVeloR$velocity_embedding[[embedding_name]]
   
-  return(lengths)
+  n_dims <- ncol(embedding)
+  
+  # Create grid
+  x_range <- range(embedding[, 1])
+  y_range <- range(embedding[, 2])
+  
+  x_grid <- seq(x_range[1], x_range[2], length.out = n_grid)
+  y_grid <- seq(y_range[1], y_range[2], length.out = n_grid)
+  
+  grid <- expand.grid(x = x_grid, y = y_grid)
+  
+  # Compute grid velocities using Gaussian kernel smoothing
+  grid_velocity <- matrix(0, nrow(grid), n_dims)
+  grid_density <- numeric(nrow(grid))
+  
+  bandwidth <- smooth * c(diff(x_range), diff(y_range)) / n_grid
+  
+  for (g in seq_len(nrow(grid))) {
+    gx <- grid$x[g]
+    gy <- grid$y[g]
+    
+    # Distances to grid point
+    dx <- embedding[, 1] - gx
+    dy <- embedding[, 2] - gy
+    
+    # Gaussian weights
+    weights <- exp(-0.5 * ((dx / bandwidth[1])^2 + (dy / bandwidth[2])^2))
+    
+    if (sum(weights) > 0 && sum(weights > 0.01) >= min_cells) {
+      weights <- weights / sum(weights)
+      
+      grid_velocity[g, ] <- colSums(velocity * weights)
+      grid_density[g] <- sum(weights > 0.01)
+    }
+  }
+  
+  # Filter out low-density grid points
+  valid <- grid_density >= min_cells
+  
+  list(
+    x = grid$x[valid],
+    y = grid$y[valid],
+    vx = grid_velocity[valid, 1],
+    vy = grid_velocity[valid, 2],
+    density = grid_density[valid]
+  )
 }
+
+#' Compute Streamline Data
+#'
+#' @description Compute streamlines for velocity stream plot.
+#'
+#' @param object Seurat object with velocity embedding
+#' @param embedding_name Name of embedding
+#' @param n_grid Grid size for streamline computation
+#' @param density Density of streamlines
+#' @param min_length Minimum streamline length
+#' @param max_length Maximum streamline length
+#'
+#' @return List with streamline data
+#' @export
+velocity_streamlines <- function(object,
+                                  embedding_name = "umap",
+                                  n_grid = 100,
+                                  density = 1,
+                                  min_length = 0.01,
+                                  max_length = 4) {
+  
+  # Get embedding
+  embedding <- get_embedding(object, embedding_name)
+  
+  if (is.null(embedding)) {
+    stop(sprintf("Embedding '%s' not found", embedding_name))
+  }
+  
+  # Get velocity embedding
+  if (is.null(object@misc$scVeloR$velocity_embedding[[embedding_name]])) {
+    stop("Run velocity_embedding() first")
+  }
+  
+  velocity <- object@misc$scVeloR$velocity_embedding[[embedding_name]]
+  
+  # Create velocity field on grid
+  x_range <- range(embedding[, 1])
+  y_range <- range(embedding[, 2])
+  
+  x_grid <- seq(x_range[1], x_range[2], length.out = n_grid)
+  y_grid <- seq(y_range[1], y_range[2], length.out = n_grid)
+  
+  # Interpolate velocity field
+  vx_field <- matrix(0, n_grid, n_grid)
+  vy_field <- matrix(0, n_grid, n_grid)
+  
+  bandwidth <- 0.1 * c(diff(x_range), diff(y_range)) / n_grid
+  
+  for (i in seq_len(n_grid)) {
+    for (j in seq_len(n_grid)) {
+      gx <- x_grid[i]
+      gy <- y_grid[j]
+      
+      dx <- embedding[, 1] - gx
+      dy <- embedding[, 2] - gy
+      
+      weights <- exp(-0.5 * ((dx / bandwidth[1])^2 + (dy / bandwidth[2])^2))
+      
+      if (sum(weights) > 0) {
+        weights <- weights / sum(weights)
+        vx_field[i, j] <- sum(velocity[, 1] * weights)
+        vy_field[i, j] <- sum(velocity[, 2] * weights)
+      }
+    }
+  }
+  
+  # Generate seed points for streamlines
+  n_seeds <- round(n_grid * density / 2)
+  seed_x <- runif(n_seeds, x_range[1], x_range[2])
+  seed_y <- runif(n_seeds, y_range[1], y_range[2])
+  
+  # Trace streamlines
+  streamlines <- list()
+  dt <- min(diff(x_grid)[1], diff(y_grid)[1]) * 0.5
+  max_steps <- round(max_length / dt)
+  
+  for (s in seq_len(n_seeds)) {
+    x <- seed_x[s]
+    y <- seed_y[s]
+    
+    line_x <- numeric(max_steps)
+    line_y <- numeric(max_steps)
+    
+    for (step in seq_len(max_steps)) {
+      line_x[step] <- x
+      line_y[step] <- y
+      
+      # Interpolate velocity at current position
+      i <- which.min(abs(x_grid - x))
+      j <- which.min(abs(y_grid - y))
+      
+      if (i < 1 || i > n_grid || j < 1 || j > n_grid) break
+      
+      vx <- vx_field[i, j]
+      vy <- vy_field[i, j]
+      
+      v_norm <- sqrt(vx^2 + vy^2)
+      if (v_norm < 1e-10) break
+      
+      # Normalize velocity and take step
+      x <- x + vx / v_norm * dt
+      y <- y + vy / v_norm * dt
+      
+      # Check bounds
+      if (x < x_range[1] || x > x_range[2] || y < y_range[1] || y > y_range[2]) break
+    }
+    
+    # Store streamline if long enough
+    valid_steps <- which(line_x != 0 | line_y != 0)
+    if (length(valid_steps) > 0) {
+      line_length <- sum(sqrt(diff(line_x[valid_steps])^2 + diff(line_y[valid_steps])^2))
+      
+      if (line_length >= min_length * max(diff(x_range), diff(y_range))) {
+        streamlines[[length(streamlines) + 1]] <- list(
+          x = line_x[valid_steps],
+          y = line_y[valid_steps]
+        )
+      }
+    }
+  }
+  
+  list(
+    streamlines = streamlines,
+    x_range = x_range,
+    y_range = y_range
+  )
+}
+
+#' Null coalescing operator
+#' @keywords internal
+`%||%` <- function(a, b) if (is.null(a)) b else a

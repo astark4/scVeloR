@@ -1,335 +1,222 @@
 #' @title Stochastic Velocity Model
-#' @description Functions for estimating RNA velocity using the stochastic model.
+#' @description Estimate RNA velocity using the stochastic model.
+#' The stochastic model uses second-order moments (variance and covariance)
+#' to estimate velocity, accounting for transcriptional bursting.
 #' @name velocity_stochastic
 NULL
 
-#' Fit Stochastic Velocity Model
+#' Compute Stochastic Velocity
 #'
-#' @description Estimate RNA velocity using second-order moments.
-#' This model accounts for transcriptional variability.
+#' @description Estimate RNA velocity using the stochastic model with second-order moments.
+#' This model accounts for noise and bursting dynamics.
 #'
-#' @param seurat_obj A Seurat object with computed moments (Ms, Mu)
-#' @param fit_offset Whether to fit offset (default: FALSE)
-#' @param fit_offset2 Whether to fit second offset (default: FALSE)
-#' @param min_r2 Minimum R-squared to consider a gene well-fit (default: 0.01)
-#' @param n_jobs Number of parallel jobs (default: 1)
+#' @param object Seurat object with moments computed
+#' @param min_r2 Minimum R-squared for velocity genes
+#' @param use_raw Use raw counts
+#' @param n_cores Number of cores
+#' @param verbose Print progress
 #'
-#' @return Modified Seurat object with velocity and fit parameters
-#'
+#' @return Seurat object with velocity in misc$scVeloR$velocity
 #' @export
-fit_velocity_stochastic <- function(seurat_obj,
-                                     fit_offset = FALSE,
-                                     fit_offset2 = FALSE,
-                                     min_r2 = 0.01,
-                                     n_jobs = 1L) {
+velocity_stochastic <- function(object,
+                                 min_r2 = 0.01,
+                                 use_raw = FALSE,
+                                 n_cores = 1,
+                                 verbose = TRUE) {
   
-  .vmessage("Fitting stochastic velocity model")
-  
-  # Check for moments
-  if (!.layer_exists(seurat_obj, "Ms") || !.layer_exists(seurat_obj, "Mu")) {
-    stop("Moments not found. Run compute_moments first.", call. = FALSE)
+  if (verbose) {
+    message("Computing stochastic velocity...")
   }
   
-  Ms <- .get_layer_data(seurat_obj, "Ms")
-  Mu <- .get_layer_data(seurat_obj, "Mu")
+  # Get first-order moments
+  data <- get_velocity_data(object, use_moments = !use_raw)
+  Ms <- data$Ms
+  Mu <- data$Mu
   
-  Ms <- make_dense(Ms)
-  Mu <- make_dense(Mu)
+  # Get second-order moments
+  if (is.null(object@misc$scVeloR$Mss)) {
+    object <- second_order_moments(object, verbose = verbose)
+  }
   
-  # Compute second-order moments
-  .vmessage("Computing second-order moments...")
-  second_moments <- compute_second_order_moments(seurat_obj)
-  Mss <- second_moments$Mss
-  Mus <- second_moments$Mus
+  Mss <- object@misc$scVeloR$Mss
+  Mus <- object@misc$scVeloR$Mus
+  Muu <- object@misc$scVeloR$Muu
   
-  # Get genes
-  genes <- rownames(Ms)
-  n_genes <- length(genes)
-  n_cells <- ncol(Ms)
-  
-  # Get velocity genes mask
-  velocity_genes <- get_velocity_genes_mask(seurat_obj, genes)
+  n_cells <- nrow(Ms)
+  n_genes <- ncol(Ms)
+  gene_names <- colnames(Ms)
   
   # Initialize results
-  gamma <- numeric(n_genes)
-  gamma2 <- numeric(n_genes)
-  offset <- numeric(n_genes)
-  offset2 <- numeric(n_genes)
-  r2 <- numeric(n_genes)
-  residual <- numeric(n_genes)
-  velocity_genes_result <- rep(FALSE, n_genes)
+  velocity <- matrix(0, n_cells, n_genes)
+  gamma <- rep(NA_real_, n_genes)
+  r2 <- rep(NA_real_, n_genes)
+  velocity_genes <- rep(FALSE, n_genes)
   
-  names(gamma) <- genes
-  names(r2) <- genes
-  names(velocity_genes_result) <- genes
-  
-  # Fit each gene
-  .vmessage("Fitting ", sum(velocity_genes), " genes...")
-  
-  fit_gene_stochastic <- function(gene_idx) {
+  # Fit each gene using stochastic model
+  fit_gene_stochastic <- function(i) {
+    s <- Ms[, i]
+    u <- Mu[, i]
+    ss <- Mss[, i]
+    us <- Mus[, i]
+    uu <- Muu[, i]
     
-    s <- Ms[gene_idx, ]
-    u <- Mu[gene_idx, ]
-    ss <- Mss[gene_idx, ]
-    us <- Mus[gene_idx, ]
+    # Skip if too few non-zero values
+    valid <- (s > 0) & (u > 0)
+    if (sum(valid) < 10) {
+      return(list(gamma = NA, r2 = NA, v = rep(0, n_cells)))
+    }
     
-    # Stochastic model uses second-order moments
-    # du = u - gamma * s - offset
-    # ds = s^2 - gamma2 * s - offset2
+    s_v <- s[valid]
+    u_v <- u[valid]
+    ss_v <- ss[valid]
+    us_v <- us[valid]
+    uu_v <- uu[valid]
     
-    result <- fit_stochastic_single(s, u, ss, us, 
-                                     fit_offset, fit_offset2)
+    # Compute variance and covariance
+    # Var(s) = <s^2> - <s>^2
+    # Cov(u,s) = <us> - <u><s>
+    var_s <- ss_v - s_v^2
+    cov_us <- us_v - u_v * s_v
     
-    return(result)
+    # Stochastic gamma estimation:
+    # gamma = Cov(u,s) / Var(s)
+    # This comes from the fact that at steady state,
+    # the covariance captures the correlation structure
+    
+    # Use cells with positive variance
+    pos_var <- var_s > 1e-10
+    
+    if (sum(pos_var) < 10) {
+      # Fall back to steady-state method
+      gamma_i <- sum(u_v * s_v) / sum(s_v^2)
+    } else {
+      gamma_i <- sum(cov_us[pos_var]) / sum(var_s[pos_var])
+    }
+    
+    # Ensure positive gamma
+    if (!is.finite(gamma_i) || gamma_i <= 0) {
+      return(list(gamma = NA, r2 = NA, v = rep(0, n_cells)))
+    }
+    
+    # Compute velocity
+    v <- u - gamma_i * s
+    
+    # R-squared (using deterministic prediction)
+    u_pred <- gamma_i * s_v
+    ss_res <- sum((u_v - u_pred)^2)
+    ss_tot <- sum((u_v - mean(u_v))^2)
+    r2_i <- 1 - ss_res / max(ss_tot, 1e-10)
+    
+    list(gamma = gamma_i, r2 = r2_i, v = v)
   }
   
   # Run fitting
-  results <- apply_with_progress(
-    seq_len(n_genes),
-    fit_gene_stochastic,
-    n_jobs = n_jobs,
-    show_progress = TRUE
-  )
+  if (n_cores > 1 && requireNamespace("parallel", quietly = TRUE)) {
+    results <- parallel::mclapply(seq_len(n_genes), fit_gene_stochastic, mc.cores = n_cores)
+  } else {
+    results <- lapply(seq_len(n_genes), function(i) {
+      if (verbose && i %% 1000 == 0) {
+        message(sprintf("  Fitted %d/%d genes", i, n_genes))
+      }
+      fit_gene_stochastic(i)
+    })
+  }
   
-  # Extract results
+  # Collect results
   for (i in seq_len(n_genes)) {
-    if (!is.null(results[[i]])) {
-      gamma[i] <- results[[i]]$gamma
-      gamma2[i] <- results[[i]]$gamma2
-      offset[i] <- results[[i]]$offset
-      offset2[i] <- results[[i]]$offset2
-      r2[i] <- results[[i]]$r2
-      residual[i] <- results[[i]]$residual
-      velocity_genes_result[i] <- velocity_genes[i] && 
-                                   !is.na(gamma[i]) && 
-                                   gamma[i] > 0 &&
-                                   r2[i] >= min_r2
+    res <- results[[i]]
+    gamma[i] <- res$gamma
+    r2[i] <- res$r2
+    velocity[, i] <- res$v
+    
+    if (!is.na(res$r2) && res$r2 >= min_r2) {
+      velocity_genes[i] <- TRUE
     }
   }
   
-  # Calculate velocity
-  .vmessage("Computing velocity...")
+  colnames(velocity) <- gene_names
+  rownames(velocity) <- rownames(Ms)
+  names(gamma) <- gene_names
+  names(r2) <- gene_names
   
-  velocity <- Mu - sweep(Ms, 1, gamma, "*")
-  if (fit_offset) {
-    velocity <- sweep(velocity, 1, offset, "-")
+  n_velocity_genes <- sum(velocity_genes)
+  
+  if (verbose) {
+    message(sprintf("  Found %d velocity genes (R² >= %.2f)", n_velocity_genes, min_r2))
   }
-  
-  # Set non-velocity genes to NA
-  velocity[!velocity_genes_result, ] <- NA
   
   # Store results
-  velocity <- as(velocity, "CsparseMatrix")
-  rownames(velocity) <- genes
-  colnames(velocity) <- colnames(Ms)
-  
-  seurat_obj <- .set_layer_data(seurat_obj, "velocity", velocity)
-  
-  # Store fit parameters
-  fit_params <- data.frame(
-    row.names = genes,
-    fit_gamma = gamma,
-    fit_gamma2 = gamma2,
-    fit_offset = offset,
-    fit_offset2 = offset2,
-    fit_r2 = r2,
-    fit_residual = residual,
-    velocity_genes = velocity_genes_result
-  )
-  
-  seurat_obj <- store_fit_params(seurat_obj, fit_params)
-  seurat_obj@misc$velocity_mode <- "stochastic"
-  
-  n_fit <- sum(velocity_genes_result, na.rm = TRUE)
-  .vmessage("Fitted ", n_fit, " velocity genes")
-  
-  return(seurat_obj)
-}
-
-#' Fit Stochastic Model for Single Gene
-#'
-#' @param s Spliced moments
-#' @param u Unspliced moments
-#' @param ss Spliced second moments
-#' @param us Cross moments
-#' @param fit_offset Whether to fit offset
-#' @param fit_offset2 Whether to fit second offset
-#' @return List with fit results
-#' @keywords internal
-fit_stochastic_single <- function(s, u, ss, us, fit_offset, fit_offset2) {
-  
-  n <- length(s)
-  
-  # Handle zeros and NAs
-  valid <- !is.na(s) & !is.na(u) & !is.na(ss) & !is.na(us) &
-           (s > 0 | u > 0)
-  
-  if (sum(valid) < 10) {
-    return(list(gamma = NA, gamma2 = NA, offset = NA, offset2 = NA, 
-                r2 = 0, residual = Inf))
+  if (is.null(object@misc$scVeloR)) {
+    object@misc$scVeloR <- list()
   }
   
-  s <- s[valid]
-  u <- u[valid]
-  ss <- ss[valid]
-  us <- us[valid]
-  
-  # Compute variances
-  var_s <- ss - s^2
-  cov_us <- us - u * s
-  
-  # Weighted regression
-  # gamma = cov(u,s) / var(s)
-  var_s_sum <- sum(pmax(var_s, 1e-10))
-  cov_us_sum <- sum(cov_us)
-  
-  gamma <- max(0, cov_us_sum / var_s_sum)
-  
-  # For second moment: ss = gamma2 * s + offset2
-  # gamma2 = sum(s * ss) / sum(s^2)
-  s2_sum <- sum(s^2)
-  if (s2_sum > 0) {
-    gamma2 <- sum(s * ss) / s2_sum
-  } else {
-    gamma2 <- 0
-  }
-  
-  # Offsets
-  if (fit_offset) {
-    offset <- mean(u) - gamma * mean(s)
-  } else {
-    offset <- 0
-  }
-  
-  if (fit_offset2) {
-    offset2 <- mean(ss) - gamma2 * mean(s)
-  } else {
-    offset2 <- 0
-  }
-  
-  # Calculate R-squared
-  u_pred <- gamma * s + offset
-  ss_res <- sum((u - u_pred)^2)
-  ss_tot <- sum((u - mean(u))^2)
-  r2 <- ifelse(ss_tot > 0, max(0, 1 - ss_res / ss_tot), 0)
-  
-  residual <- sqrt(ss_res / length(u))
-  
-  list(
+  object@misc$scVeloR$velocity <- list(
+    velocity_s = velocity,
     gamma = gamma,
-    gamma2 = gamma2,
-    offset = offset,
-    offset2 = offset2,
     r2 = r2,
-    residual = residual
+    velocity_genes = which(velocity_genes),
+    mode = "stochastic",
+    min_r2 = min_r2
   )
+  
+  if (verbose) {
+    message("Done. Velocity stored in object@misc$scVeloR$velocity")
+  }
+  
+  object
 }
 
-#' Generalized Least Squares for Velocity
+#' Compute Variance Velocity
 #'
-#' @description Fit velocity using generalized least squares with variance weighting.
+#' @description Compute velocity based on variance decomposition.
+#' This is an alternative formulation of the stochastic model.
 #'
-#' @param s Spliced values
-#' @param u Unspliced values
-#' @param ss Second moment of spliced
-#' @param us Cross moment
-#' @param fit_offset Whether to fit offset
-#' @return List with gamma, offset, and r2
+#' @param object Seurat object with second-order moments
+#' @param verbose Print progress
+#'
+#' @return Seurat object with variance-based velocity
 #' @keywords internal
-leastsq_generalized <- function(s, u, ss, us, fit_offset = FALSE) {
+variance_velocity <- function(object, verbose = TRUE) {
   
-  # Compute variance weights
-  var_s <- pmax(ss - s^2, 1e-10)
-  w <- 1 / var_s
-  w <- w / sum(w)
+  if (is.null(object@misc$scVeloR$Mss)) {
+    object <- second_order_moments(object, verbose = verbose)
+  }
   
-  # Weighted regression
-  sw <- s * w
-  uw <- u * w
+  # Get moments
+  Ms <- object@misc$scVeloR$Ms
+  Mu <- object@misc$scVeloR$Mu
+  Mss <- object@misc$scVeloR$Mss
+  Mus <- object@misc$scVeloR$Mus
+  Muu <- object@misc$scVeloR$Muu
   
-  if (fit_offset) {
-    # With intercept
-    X <- cbind(1, s)
-    Xw <- X * sqrt(w)
-    yw <- u * sqrt(w)
+  n_cells <- nrow(Ms)
+  n_genes <- ncol(Ms)
+  
+  # Compute variances and covariances
+  var_s <- Mss - Ms^2
+  var_u <- Muu - Mu^2
+  cov_us <- Mus - Mu * Ms
+  
+  # Velocity based on variance ratio
+  # This captures the directional change in expression variance
+  velocity <- matrix(0, n_cells, n_genes)
+  
+  for (i in seq_len(n_genes)) {
+    var_s_i <- var_s[, i]
+    cov_us_i <- cov_us[, i]
     
-    fit <- tryCatch({
-      coef <- solve(t(Xw) %*% Xw) %*% t(Xw) %*% yw
-      list(gamma = coef[2], offset = coef[1])
-    }, error = function(e) {
-      list(gamma = sum(sw * u) / sum(sw * s), offset = 0)
-    })
-  } else {
-    # No intercept
-    fit <- list(
-      gamma = sum(sw * u) / sum(sw * s),
-      offset = 0
-    )
-  }
-  
-  # R-squared
-  pred <- fit$gamma * s + fit$offset
-  ss_res <- sum(w * (u - pred)^2)
-  ss_tot <- sum(w * (u - sum(uw))^2)
-  r2 <- max(0, 1 - ss_res / ss_tot)
-  
-  fit$r2 <- r2
-  return(fit)
-}
-
-#' Maximum Likelihood Velocity Estimation
-#'
-#' @description Estimate velocity using maximum likelihood with assumed noise model.
-#'
-#' @param u Unspliced values
-#' @param s Spliced values
-#' @param fit_offset Whether to fit offset
-#' @return List with gamma, offset, and likelihood
-#' @keywords internal
-maximum_likelihood <- function(u, s, fit_offset = FALSE) {
-  
-  n <- length(u)
-  
-  # Initial estimates
-  if (fit_offset) {
-    init <- stats::lm(u ~ s)
-    gamma0 <- stats::coef(init)[2]
-    offset0 <- stats::coef(init)[1]
-  } else {
-    gamma0 <- sum(s * u) / sum(s^2)
-    offset0 <- 0
-  }
-  
-  # Negative log-likelihood assuming Gaussian noise
-  neg_log_lik <- function(par) {
-    if (fit_offset) {
-      gamma <- par[1]
-      offset <- par[2]
-    } else {
-      gamma <- par[1]
-      offset <- 0
+    # Gamma from covariance/variance ratio
+    gamma_i <- sum(cov_us_i, na.rm = TRUE) / sum(var_s_i + 1e-10, na.rm = TRUE)
+    
+    if (is.finite(gamma_i) && gamma_i > 0) {
+      velocity[, i] <- Mu[, i] - gamma_i * Ms[, i]
     }
-    
-    residual <- u - gamma * s - offset
-    sigma <- max(1e-10, stats::sd(residual))
-    
-    -sum(stats::dnorm(residual, mean = 0, sd = sigma, log = TRUE))
   }
   
-  # Optimize
-  if (fit_offset) {
-    opt <- stats::optim(c(gamma0, offset0), neg_log_lik, method = "L-BFGS-B",
-                        lower = c(0, -Inf), upper = c(Inf, Inf))
-    gamma <- opt$par[1]
-    offset <- opt$par[2]
-  } else {
-    opt <- stats::optim(gamma0, neg_log_lik, method = "L-BFGS-B",
-                        lower = 0, upper = Inf)
-    gamma <- opt$par[1]
-    offset <- 0
-  }
+  colnames(velocity) <- colnames(Ms)
+  rownames(velocity) <- rownames(Ms)
   
-  likelihood <- -opt$value
+  object@misc$scVeloR$variance_velocity <- velocity
   
-  list(gamma = gamma, offset = offset, likelihood = likelihood)
+  object
 }

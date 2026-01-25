@@ -1,271 +1,171 @@
-// knn_utils.cpp - KNN-related utility functions
-// Author: Zaoqu Liu
-//
-// Helper functions for neighbor graph construction
-
-#include "scVeloR_types.h"
-
+// [[Rcpp::depends(RcppArmadillo)]]
+#include <RcppArmadillo.h>
 using namespace Rcpp;
 
-//' Get iterative neighbor indices (neighbors of neighbors)
-//'
-//' @param neighbor_matrix Matrix of neighbor indices (cells x n_neighbors), 0-based
-//' @param cell_idx Cell index (0-based)
-//' @param n_recurse Number of recursions
-//' @param max_neighbors Maximum neighbors to return
-//' @return Vector of unique neighbor indices
+//' Compute Euclidean Distance Matrix
+//' 
+//' @param X Data matrix (cells x features)
+//' @return Distance matrix
 //' @keywords internal
 // [[Rcpp::export]]
-IntegerVector get_iterative_neighbors_cpp(const IntegerMatrix& neighbor_matrix,
-                                           int cell_idx,
-                                           int n_recurse = 2,
-                                           int max_neighbors = 100) {
-    int n_neighbors = neighbor_matrix.ncol();
+arma::mat euclidean_distances_cpp(const arma::mat& X) {
+    int n = X.n_rows;
+    arma::mat D(n, n, arma::fill::zeros);
     
-    // Use set to track unique neighbors
-    std::set<int> neighbor_set;
-    std::vector<int> current_level;
-    
-    // Start with direct neighbors
-    for (int j = 0; j < n_neighbors; j++) {
-        int neighbor = neighbor_matrix(cell_idx, j);
-        if (neighbor >= 0 && neighbor != cell_idx) {
-            neighbor_set.insert(neighbor);
-            current_level.push_back(neighbor);
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            double dist = arma::norm(X.row(i) - X.row(j));
+            D(i, j) = dist;
+            D(j, i) = dist;
         }
     }
     
-    // Recursively add neighbors of neighbors
-    for (int r = 1; r < n_recurse; r++) {
-        std::vector<int> next_level;
-        
-        for (int idx : current_level) {
-            for (int j = 0; j < n_neighbors; j++) {
-                int neighbor = neighbor_matrix(idx, j);
-                if (neighbor >= 0 && neighbor != cell_idx) {
-                    if (neighbor_set.find(neighbor) == neighbor_set.end()) {
-                        neighbor_set.insert(neighbor);
-                        next_level.push_back(neighbor);
-                    }
-                }
-            }
-        }
-        
-        current_level = next_level;
-        
-        // Stop if we have enough neighbors
-        if ((int)neighbor_set.size() >= max_neighbors) {
-            break;
-        }
-    }
-    
-    // Convert to vector
-    IntegerVector result(neighbor_set.begin(), neighbor_set.end());
-    
-    // Randomly sample if too many
-    if (result.size() > max_neighbors) {
-        // Simple random sampling without replacement
-        IntegerVector indices = seq(0, result.size() - 1);
-        std::random_shuffle(indices.begin(), indices.end());
-        
-        IntegerVector sampled(max_neighbors);
-        for (int i = 0; i < max_neighbors; i++) {
-            sampled[i] = result[indices[i]];
-        }
-        return sampled;
-    }
-    
-    return result;
+    return D;
 }
 
-//' Convert neighbor indices to sparse connectivity matrix
-//'
-//' @param indices Matrix of neighbor indices (cells x n_neighbors), 0-based
-//' @param distances Matrix of distances (cells x n_neighbors)
-//' @param n_cells Total number of cells
-//' @param mode "distances" or "connectivities"
-//' @return Sparse matrix
+//' Find K Nearest Neighbors
+//' 
+//' @param D Distance matrix
+//' @param k Number of neighbors
+//' @return List with indices and distances
 //' @keywords internal
 // [[Rcpp::export]]
-arma::sp_mat indices_to_sparse_cpp(const IntegerMatrix& indices,
-                                    const NumericMatrix& distances,
-                                    int n_cells,
-                                    std::string mode = "connectivities") {
-    int n_neighbors = indices.ncol();
+List knn_from_distances_cpp(const arma::mat& D, int k) {
+    int n = D.n_rows;
     
-    // Count non-zero entries
-    std::vector<arma::uword> row_idx;
-    std::vector<arma::uword> col_idx;
-    std::vector<double> values;
+    arma::imat indices(n, k);
+    arma::mat distances(n, k);
     
-    row_idx.reserve(n_cells * n_neighbors);
-    col_idx.reserve(n_cells * n_neighbors);
-    values.reserve(n_cells * n_neighbors);
-    
-    for (int i = 0; i < n_cells; i++) {
-        for (int j = 0; j < n_neighbors; j++) {
-            int neighbor = indices(i, j);
-            if (neighbor >= 0 && neighbor < n_cells) {
-                row_idx.push_back(i);
-                col_idx.push_back(neighbor);
-                
-                if (mode == "distances") {
-                    values.push_back(distances(i, j));
-                } else {
-                    // Connectivity: 1 if neighbor, 0 otherwise
-                    values.push_back(1.0);
-                }
-            }
+    for (int i = 0; i < n; i++) {
+        arma::vec d = D.row(i).t();
+        d(i) = arma::datum::inf;  // Exclude self
+        
+        arma::uvec sorted_idx = arma::sort_index(d);
+        
+        for (int j = 0; j < k; j++) {
+            indices(i, j) = sorted_idx(j) + 1;  // 1-based indexing
+            distances(i, j) = d(sorted_idx(j));
         }
     }
     
-    // Create sparse matrix
-    arma::umat locations(2, row_idx.size());
-    for (size_t i = 0; i < row_idx.size(); i++) {
-        locations(0, i) = row_idx[i];
-        locations(1, i) = col_idx[i];
-    }
-    
-    arma::vec vals(values);
-    
-    return arma::sp_mat(locations, vals, n_cells, n_cells);
+    return List::create(
+        Named("indices") = indices,
+        Named("distances") = distances
+    );
 }
 
-//' Compute adaptive kernel width for connectivity
-//'
-//' Based on local bandwidth estimation as in UMAP
-//'
-//' @param distances Matrix of distances (cells x n_neighbors)
-//' @param local_connectivity Local connectivity parameter (default: 1)
-//' @return Vector of kernel widths (sigma) per cell
+//' Compute Cosine Distance Matrix
+//' 
+//' @param X Data matrix (cells x features)
+//' @return Cosine distance matrix (1 - cosine similarity)
 //' @keywords internal
 // [[Rcpp::export]]
-NumericVector compute_sigma_cpp(const NumericMatrix& distances,
+arma::mat cosine_distances_cpp(const arma::mat& X) {
+    int n = X.n_rows;
+    
+    // Normalize rows
+    arma::mat X_norm = X;
+    for (int i = 0; i < n; i++) {
+        double norm = arma::norm(X.row(i));
+        if (norm > 0) {
+            X_norm.row(i) /= norm;
+        }
+    }
+    
+    // Cosine similarity
+    arma::mat sim = X_norm * X_norm.t();
+    
+    // Convert to distance
+    arma::mat D = 1.0 - sim;
+    
+    return D;
+}
+
+//' Compute Connectivity Weights
+//' 
+//' @description UMAP-style connectivity computation
+//' 
+//' @param indices Neighbor indices (1-based)
+//' @param distances Neighbor distances
+//' @param n_cells Number of cells
+//' @param local_connectivity Local connectivity parameter
+//' 
+//' @return List with i, j, x for sparse matrix construction
+//' @keywords internal
+// [[Rcpp::export]]
+List compute_connectivities_cpp(const arma::imat& indices,
+                                 const arma::mat& distances,
+                                 int n_cells,
                                  double local_connectivity = 1.0) {
-    int n_cells = distances.nrow();
-    int n_neighbors = distances.ncol();
     
-    NumericVector sigma(n_cells);
+    int n_neighbors = indices.n_cols;
     
-    // Target is to have local_connectivity neighbors "effectively connected"
-    double target = std::log2(n_neighbors);
+    std::vector<int> i_vec;
+    std::vector<int> j_vec;
+    std::vector<double> x_vec;
     
+    i_vec.reserve(n_cells * n_neighbors * 2);
+    j_vec.reserve(n_cells * n_neighbors * 2);
+    x_vec.reserve(n_cells * n_neighbors * 2);
+    
+    // For each cell, compute bandwidth and weights
     for (int i = 0; i < n_cells; i++) {
-        // Get sorted distances for this cell
-        std::vector<double> dists(n_neighbors);
-        for (int j = 0; j < n_neighbors; j++) {
-            dists[j] = distances(i, j);
-        }
-        std::sort(dists.begin(), dists.end());
+        arma::rowvec d = distances.row(i);
         
-        // Estimate rho (distance to closest neighbor)
-        double rho = dists[0];
-        if (rho < 1e-10) {
-            rho = dists[1];  // Skip if first is essentially zero
-        }
+        // Find rho (distance to nearest neighbor based on local_connectivity)
+        arma::vec d_sorted = arma::sort(d.t());
+        int rho_idx = std::min((int)local_connectivity - 1, (int)d_sorted.n_elem - 1);
+        rho_idx = std::max(rho_idx, 0);
+        double rho = d_sorted(rho_idx);
         
         // Binary search for sigma
-        double lo = 0.0;
-        double hi = 1000.0;  // Upper bound
-        double mid = 1.0;
+        double target = std::log2(n_neighbors);
+        double lo = 1e-10;
+        double hi = arma::max(d) * 10;
+        double sigma = 1.0;
         
         for (int iter = 0; iter < 64; iter++) {
-            mid = (lo + hi) / 2.0;
+            double mid = (lo + hi) / 2.0;
             
-            // Compute effective number of neighbors
-            double sum = 0.0;
-            for (int j = 0; j < n_neighbors; j++) {
-                double d = std::max(0.0, dists[j] - rho);
-                sum += std::exp(-d / mid);
+            double val = 0.0;
+            for (int k = 0; k < n_neighbors; k++) {
+                double dk = std::max(d(k) - rho, 0.0);
+                val += std::exp(-dk / mid);
             }
             
-            if (std::abs(sum - target) < 1e-5) {
+            if (std::abs(val - target) < 1e-5) {
+                sigma = mid;
                 break;
             }
             
-            if (sum < target) {
-                lo = mid;
-            } else {
+            if (val > target) {
                 hi = mid;
+            } else {
+                lo = mid;
             }
+            sigma = mid;
         }
         
-        sigma[i] = mid;
-    }
-    
-    return sigma;
-}
-
-//' Compute UMAP-style connectivities from distances
-//'
-//' @param distances Sparse distance matrix
-//' @param set_op_mix_ratio Mix ratio for set operations (default: 1.0)
-//' @return Sparse connectivity matrix
-//' @keywords internal
-// [[Rcpp::export]]
-arma::sp_mat compute_connectivities_umap_cpp(const arma::sp_mat& distances,
-                                              double set_op_mix_ratio = 1.0) {
-    int n = distances.n_rows;
-    
-    // Find local sigmas
-    std::vector<double> sigmas(n, 1.0);
-    std::vector<double> rhos(n, 0.0);
-    
-    // Iterate over rows
-    for (int i = 0; i < n; i++) {
-        // Get non-zero distances for this row
-        std::vector<double> row_dists;
-        for (arma::sp_mat::const_row_iterator it = distances.begin_row(i);
-             it != distances.end_row(i); ++it) {
-            if (*it > 0) {
-                row_dists.push_back(*it);
-            }
-        }
-        
-        if (row_dists.size() > 0) {
-            std::sort(row_dists.begin(), row_dists.end());
-            rhos[i] = row_dists[0];
+        // Compute weights
+        for (int k = 0; k < n_neighbors; k++) {
+            int j = indices(i, k) - 1;  // Convert to 0-based
             
-            // Estimate sigma using binary search
-            double target = std::log2(row_dists.size());
-            double lo = 0.0, hi = 1000.0, mid = 1.0;
-            
-            for (int iter = 0; iter < 64; iter++) {
-                mid = (lo + hi) / 2.0;
-                double sum = 0.0;
-                for (double d : row_dists) {
-                    sum += std::exp(-std::max(0.0, d - rhos[i]) / mid);
+            if (j >= 0 && j < n_cells && j != i) {
+                double dk = std::max(d(k) - rho, 0.0);
+                double w = std::exp(-dk / sigma);
+                
+                if (w > 0) {
+                    i_vec.push_back(i);
+                    j_vec.push_back(j);
+                    x_vec.push_back(w);
                 }
-                if (std::abs(sum - target) < 1e-5) break;
-                if (sum < target) lo = mid;
-                else hi = mid;
             }
-            sigmas[i] = mid;
         }
     }
     
-    // Compute connectivities
-    arma::sp_mat conn = distances;
-    
-    for (arma::sp_mat::iterator it = conn.begin(); it != conn.end(); ++it) {
-        int i = it.row();
-        double d = *it;
-        double rho_i = rhos[i];
-        double sigma_i = sigmas[i];
-        
-        double new_val = std::exp(-std::max(0.0, d - rho_i) / sigma_i);
-        *it = new_val;
-    }
-    
-    // Symmetrize: fuzzy set union
-    arma::sp_mat conn_t = conn.t();
-    arma::sp_mat result = conn + conn_t - conn % conn_t;
-    
-    // Mix with simple average if needed
-    if (set_op_mix_ratio < 1.0) {
-        arma::sp_mat simple_avg = (conn + conn_t) / 2.0;
-        result = set_op_mix_ratio * result + (1.0 - set_op_mix_ratio) * simple_avg;
-    }
-    
-    return result;
+    return List::create(
+        Named("i") = wrap(i_vec),
+        Named("j") = wrap(j_vec),
+        Named("x") = wrap(x_vec)
+    );
 }

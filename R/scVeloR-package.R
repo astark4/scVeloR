@@ -1,83 +1,81 @@
-#' @title scVeloR: RNA Velocity Analysis for Single-Cell RNA-Seq Data
+#' @title scVeloR: RNA Velocity Analysis in R
 #'
 #' @description
-#' scVeloR provides a comprehensive R implementation of RNA velocity analysis
-#' for single-cell RNA sequencing data. The package implements steady-state,
-#' stochastic, and dynamical velocity models, along with visualization tools.
+#' A comprehensive R implementation of RNA velocity analysis based on the 
+#' scvelo Python package. This package enables estimation of RNA velocities 
+#' for single-cell RNA-seq data, supporting deterministic (steady-state), 
+#' stochastic, and dynamical models.
 #'
 #' @section Main Functions:
 #' \describe{
-#'   \item{Preprocessing}{
-#'     \code{\link{filter_genes}}, \code{\link{normalize_layers}},
-#'     \code{\link{compute_moments}}, \code{\link{filter_and_normalize}}
-#'   }
-#'   \item{Velocity Estimation}{
-#'     \code{\link{velocity}}, \code{\link{fit_velocity_steady}},
-#'     \code{\link{fit_velocity_stochastic}}, \code{\link{recover_dynamics}}
-#'   }
-#'   \item{Velocity Graph}{
-#'     \code{\link{compute_velocity_graph}}, \code{\link{project_velocity_embedding}},
-#'     \code{\link{transition_matrix}}
-#'   }
-#'   \item{Visualization}{
-#'     \code{\link{velocity_embedding_plot}}, \code{\link{velocity_stream_plot}},
-#'     \code{\link{velocity_grid_plot}}, \code{\link{velocity_heatmap}}
-#'   }
+#'   \item{\code{\link{run_velocity}}}{Full velocity analysis pipeline}
+#'   \item{\code{\link{velocity}}}{Compute RNA velocity}
+#'   \item{\code{\link{velocity_graph}}}{Build velocity graph}
+#'   \item{\code{\link{velocity_embedding}}}{Project velocity onto embedding}
+#'   \item{\code{\link{compute_latent_time}}}{Compute gene-shared latent time}
 #' }
 #'
-#' @section Seurat Compatibility:
-#' scVeloR is fully compatible with Seurat V4 and V5 objects. The package
-#' automatically detects the Seurat version and uses appropriate methods
-#' for data access.
+#' @section Velocity Models:
+#' \describe{
+#'   \item{Deterministic}{Steady-state model assuming equilibrium}
+#'   \item{Stochastic}{Uses second-order moments for noise modeling}
+#'   \item{Dynamical}{Full kinetics model with EM algorithm}
+#' }
 #'
-#' @section Parallel Computing:
-#' scVeloR supports parallel computation through the \code{future} framework.
-#' Use \code{future::plan()} to configure parallel backends.
+#' @section Preprocessing:
+#' \describe{
+#'   \item{\code{\link{prepare_velocity}}}{Prepare data for velocity analysis}
+#'   \item{\code{\link{filter_genes}}}{Filter genes by expression criteria}
+#'   \item{\code{\link{moments}}}{Compute neighbor-averaged moments}
+#'   \item{\code{\link{compute_neighbors}}}{Compute k-nearest neighbors}
+#' }
+#'
+#' @section Visualization:
+#' \describe{
+#'   \item{\code{\link{plot_velocity}}}{Plot velocity arrows}
+#'   \item{\code{\link{plot_velocity_stream}}}{Plot velocity streamlines}
+#'   \item{\code{\link{plot_velocity_grid}}}{Plot velocity on grid}
+#'   \item{\code{\link{plot_phase}}}{Plot phase portraits}
+#' }
+#'
+#' @section Example Usage:
+#' \preformatted{
+#' library(scVeloR)
+#' library(Seurat)
+#'
+#' # Load Seurat object with spliced and unspliced layers
+#' seurat_obj <- readRDS("your_seurat_object.rds")
+#'
+#' # Run full velocity pipeline
+#' seurat_obj <- run_velocity(seurat_obj, mode = "dynamical")
+#'
+#' # Visualize results
+#' plot_velocity(seurat_obj, embedding = "umap")
+#' plot_velocity_stream(seurat_obj, embedding = "umap")
+#' }
 #'
 #' @author Zaoqu Liu \email{liuzaoqu@@163.com}
-#' @seealso
-#' Useful links:
-#' \itemize{
-#'   \item \url{https://github.com/Zaoqu-Liu/scVeloR}
-#'   \item Report bugs at \url{https://github.com/Zaoqu-Liu/scVeloR/issues}
-#' }
+#' @references
+#' Bergen, V., Lange, M., Peidli, S. et al. (2020). 
+#' Generalizing RNA velocity to transient cell states through dynamical modeling. 
+#' Nature Biotechnology. \doi{10.1038/s41587-020-0591-3}
+#'
+#' La Manno, G., Soldatov, R., Zeisel, A. et al. (2018). 
+#' RNA velocity of single cells. 
+#' Nature. \doi{10.1038/s41586-018-0414-6}
 #'
 #' @docType package
 #' @name scVeloR-package
 #' @aliases scVeloR
+#'
 #' @useDynLib scVeloR, .registration = TRUE
 #' @importFrom Rcpp sourceCpp
-"_PACKAGE"
+#' @importFrom Matrix sparseMatrix drop0 Diagonal
+#' @importFrom stats optim lm coef quantile sd median density dist setNames na.omit
+#' @importFrom utils head tail
+#' @importFrom grDevices colorRampPalette
+#' @importFrom methods new slot slotNames
+NULL
 
-# Package-level options
-.onLoad <- function(libname, pkgname) {
-  # Set default options
-  op <- options()
-  op.scVeloR <- list(
-    scVeloR.verbose = TRUE,
-    scVeloR.n_jobs = 1L,
-    scVeloR.progress = TRUE
-  )
-  toset <- !(names(op.scVeloR) %in% names(op))
-  if (any(toset)) options(op.scVeloR[toset])
-  
-  invisible()
-}
-
-.onAttach <- function(libname, pkgname) {
-  packageStartupMessage(
-    "scVeloR v", utils::packageVersion("scVeloR"), "\n",
-    "RNA Velocity Analysis for Single-Cell RNA-Seq Data\n",
-    "Author: Zaoqu Liu <liuzaoqu@163.com>\n",
-    "GitHub: https://github.com/Zaoqu-Liu/scVeloR"
-  )
-}
-
-# Global variables to avoid R CMD check notes
-utils::globalVariables(c(
-  ".", "x", "y", "vx", "vy", "color", "size", "alpha",
-  "velocity", "spliced", "unspliced", "Ms", "Mu",
-  "gene", "cell", "value", "cluster", "time",
-  "start_x", "start_y", "end_x", "end_y",
-  "grid_x", "grid_y", "magnitude"
-))
+#' @importFrom Matrix sparseMatrix drop0 Diagonal t
+NULL
