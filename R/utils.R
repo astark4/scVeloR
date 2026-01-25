@@ -171,17 +171,128 @@ weighted_mean <- function(x, w) {
 
 #' Check Seurat Version
 #'
-#' @description Check if Seurat V5 or V4.
+#' @description Check if Seurat V5 or V4. Priority: V4 compatibility.
 #'
-#' @param object Seurat object
+#' @param object Seurat object (optional, can detect from package version)
 #'
 #' @return Integer (4 or 5)
 #' @keywords internal
-seurat_version <- function(object) {
-  if ("Assay5" %in% class(object@assays[[Seurat::DefaultAssay(object)]])) {
+seurat_version <- function(object = NULL) {
+  # First check package version
+  pkg_version <- utils::packageVersion("Seurat")
+  major_version <- as.integer(strsplit(as.character(pkg_version), "\\.")[[1]][1])
+  
+  if (major_version >= 5) {
+    # Seurat 5.x installed, but check object structure
+    if (!is.null(object)) {
+      assay <- object@assays[[Seurat::DefaultAssay(object)]]
+      # V5 uses Assay5 class
+      if ("Assay5" %in% class(assay)) {
+        return(5L)
+      }
+      # V5 can also have Assay objects (legacy mode)
+      if ("Assay" %in% class(assay) && !("Assay5" %in% class(assay))) {
+        return(4L)
+      }
+    }
     return(5L)
   }
+  
   return(4L)
+}
+
+#' Check if Layer Exists in Seurat Object
+#'
+#' @description Check if a specific layer exists in Seurat object.
+#' Handles both V4 and V5 structures.
+#'
+#' @param object Seurat object
+#' @param layer_name Name of layer to check
+#' @param assay Assay name (default: DefaultAssay)
+#'
+#' @return Logical
+#' @keywords internal
+has_layer <- function(object, layer_name, assay = NULL) {
+  if (is.null(assay)) {
+    assay <- Seurat::DefaultAssay(object)
+  }
+  
+  version <- seurat_version(object)
+  
+  if (version == 5) {
+    # V5: Check layers
+    tryCatch({
+      layers <- Seurat::Layers(object, assay = assay)
+      return(layer_name %in% layers)
+    }, error = function(e) {
+      return(FALSE)
+    })
+  } else {
+    # V4: Check slots and custom storage
+    assay_obj <- object@assays[[assay]]
+    
+    # Standard slots
+    if (layer_name %in% c("counts", "data", "scale.data")) {
+      slot_data <- tryCatch(
+        slot(assay_obj, layer_name),
+        error = function(e) NULL
+      )
+      return(!is.null(slot_data) && length(slot_data) > 0)
+    }
+    
+    # Try GetAssayData for any slot name
+    tryCatch({
+      data <- Seurat::GetAssayData(object, slot = layer_name, assay = assay)
+      return(!is.null(data) && length(data) > 0)
+    }, error = function(e) {
+      return(FALSE)
+    })
+  }
+}
+
+#' Get Available Layers in Seurat Object
+#'
+#' @description Get list of available layers in Seurat object.
+#'
+#' @param object Seurat object
+#' @param assay Assay name (default: DefaultAssay)
+#'
+#' @return Character vector of layer names
+#' @keywords internal
+get_available_layers <- function(object, assay = NULL) {
+  if (is.null(assay)) {
+    assay <- Seurat::DefaultAssay(object)
+  }
+  
+  version <- seurat_version(object)
+  
+  if (version == 5) {
+    # V5: Use Layers function
+    tryCatch({
+      Seurat::Layers(object, assay = assay)
+    }, error = function(e) {
+      character(0)
+    })
+  } else {
+    # V4: Check standard slots
+    assay_obj <- object@assays[[assay]]
+    layers <- character(0)
+    
+    # Check standard slots
+    for (slot_name in c("counts", "data", "scale.data")) {
+      tryCatch({
+        slot_data <- slot(assay_obj, slot_name)
+        if (!is.null(slot_data) && length(slot_data) > 0 && 
+            (is.matrix(slot_data) || inherits(slot_data, "sparseMatrix"))) {
+          if (nrow(slot_data) > 0 && ncol(slot_data) > 0) {
+            layers <- c(layers, slot_name)
+          }
+        }
+      }, error = function(e) {})
+    }
+    
+    layers
+  }
 }
 
 #' Safe Divide

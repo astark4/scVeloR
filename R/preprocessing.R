@@ -297,38 +297,120 @@ second_order_moments <- function(object,
 #'
 #' @description Extract layer matrix from Seurat object.
 #' Handles both Seurat V4 and V5 object structures.
+#' Priority: V4 compatibility.
 #'
 #' @param object Seurat object
-#' @param layer_name Name of layer
+#' @param layer_name Name of layer (e.g., "spliced", "unspliced", "counts", "data")
+#' @param assay Assay name (default: DefaultAssay)
 #'
 #' @return Dense matrix (cells x genes)
-#' @keywords internal
-get_layer_matrix <- function(object, layer_name) {
+#' @export
+get_layer_matrix <- function(object, layer_name, assay = NULL) {
   
-  # Try Seurat V5 structure first
-  if ("Assay5" %in% class(object@assays[[Seurat::DefaultAssay(object)]])) {
-    # V5: Use LayerData
-    if (layer_name %in% Seurat::Layers(object)) {
-      mat <- Seurat::LayerData(object, layer = layer_name)
-    } else {
-      stop(sprintf("Layer '%s' not found", layer_name))
-    }
+  if (is.null(assay)) {
+    assay <- Seurat::DefaultAssay(object)
+  }
+  
+  version <- seurat_version(object)
+  mat <- NULL
+  
+  if (version == 5) {
+    # Seurat V5: Use LayerData
+    tryCatch({
+      available_layers <- Seurat::Layers(object, assay = assay)
+      
+      if (layer_name %in% available_layers) {
+        mat <- Seurat::LayerData(object, layer = layer_name, assay = assay)
+      } else {
+        # Try to find similar layer name
+        matched <- grep(layer_name, available_layers, ignore.case = TRUE, value = TRUE)
+        if (length(matched) > 0) {
+          mat <- Seurat::LayerData(object, layer = matched[1], assay = assay)
+          message(sprintf("Note: Using layer '%s' instead of '%s'", matched[1], layer_name))
+        }
+      }
+    }, error = function(e) {
+      mat <<- NULL
+    })
   } else {
-    # V4: Use GetAssayData
-    if (layer_name %in% names(object@assays[[Seurat::DefaultAssay(object)]]@layers)) {
-      mat <- Seurat::GetAssayData(object, slot = layer_name)
-    } else if (layer_name %in% slotNames(object@assays[[Seurat::DefaultAssay(object)]])) {
-      mat <- slot(object@assays[[Seurat::DefaultAssay(object)]], layer_name)
-    } else {
-      stop(sprintf("Layer '%s' not found", layer_name))
+    # Seurat V4: Priority method - GetAssayData with slot parameter
+    
+    # Map common layer names to V4 slots
+    slot_map <- list(
+      "counts" = "counts",
+      "data" = "data",
+      "scale.data" = "scale.data",
+      "spliced" = "counts",      # Default mapping for velocity
+      "unspliced" = "counts"     # Will try custom approach
+    )
+    
+    # First, try GetAssayData with the layer name as slot
+    tryCatch({
+      mat <- Seurat::GetAssayData(object, slot = layer_name, assay = assay)
+    }, error = function(e) {
+      mat <<- NULL
+    })
+    
+    # If not found and it's a velocity layer, try alternative approaches
+    if (is.null(mat) || length(mat) == 0) {
+      assay_obj <- object@assays[[assay]]
+      
+      # Try direct slot access for standard slots
+      if (layer_name %in% c("counts", "data", "scale.data")) {
+        tryCatch({
+          mat <- slot(assay_obj, layer_name)
+        }, error = function(e) {
+          mat <<- NULL
+        })
+      }
+      
+      # For spliced/unspliced, try multiple approaches
+      if (is.null(mat) && layer_name %in% c("spliced", "unspliced")) {
+        # Approach 1: Check if there's a separate assay with this name
+        if (layer_name %in% names(object@assays)) {
+          tryCatch({
+            mat <- Seurat::GetAssayData(object, slot = "counts", assay = layer_name)
+          }, error = function(e) {
+            mat <<- NULL
+          })
+        }
+        
+        # Approach 2: Check misc storage (common for velocity data)
+        if (is.null(mat) && !is.null(object@misc[[layer_name]])) {
+          mat <- object@misc[[layer_name]]
+        }
+        
+        # Approach 3: Check scVeloR storage
+        if (is.null(mat) && !is.null(object@misc$scVeloR[[layer_name]])) {
+          mat <- object@misc$scVeloR[[layer_name]]
+        }
+      }
     }
   }
   
-  # Convert to dense matrix (cells x genes)
+  # Check if matrix was found
+  if (is.null(mat) || length(mat) == 0) {
+    # Provide helpful error message
+    available <- get_available_layers(object, assay)
+    stop(sprintf(
+      "Layer '%s' not found in assay '%s'. Available layers: %s\n%s",
+      layer_name, assay,
+      paste(available, collapse = ", "),
+      "For velocity analysis, ensure spliced/unspliced counts are loaded."
+    ))
+  }
+  
+  # Convert to standard matrix format (cells x genes)
   if (inherits(mat, "sparseMatrix")) {
     mat <- as.matrix(mat)
   }
   
+  if (!is.matrix(mat)) {
+    mat <- as.matrix(mat)
+  }
+  
+  # Check orientation: should be cells x genes
+  # Seurat stores genes x cells, so transpose if needed
   if (nrow(mat) != ncol(object)) {
     mat <- t(mat)
   }

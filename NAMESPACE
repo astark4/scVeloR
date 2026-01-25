@@ -73,7 +73,7 @@ export(plot_velocity_stream)
 export(plot_velocity_grid)
 export(plot_phase)
 
-# Data conversion
+# Data conversion and Seurat compatibility
 export(import_velocity_data)
 export(create_velocity_seurat)
 export(export_velocity_results)
@@ -81,11 +81,14 @@ export(import_from_anndata)
 export(export_to_anndata)
 export(get_embedding)
 export(get_velocity_data)
+export(get_layer_matrix)
 
 # Imports
-import(Matrix)
 import(methods)
 import(R6)
+
+# Import specific Matrix functions to avoid conflicts
+importFrom(Matrix, sparseMatrix, drop0, rowSums, colSums, t)
 
 importFrom(Rcpp, sourceCpp)
 importFrom(stats, optim, lm, coef, quantile, sd, median, density, dist, setNames, na.omit, prcomp, var, pchisq, pnorm)

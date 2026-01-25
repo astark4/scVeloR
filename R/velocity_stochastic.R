@@ -361,40 +361,44 @@ cross_moments <- function(X, Y, connectivities) {
 
 #' Helper to extract velocity data from Seurat
 #'
+#' @description Extract spliced and unspliced data from Seurat object.
+#' Compatible with both Seurat V4 and V5.
+#'
 #' @keywords internal
 extract_velocity_data <- function(seurat, assay, layer_s, layer_u) {
-  if (!requireNamespace("SeuratObject", quietly = TRUE)) {
-    stop("SeuratObject package is required")
-  }
   
-  # Get expression data
-  if (utils::packageVersion("SeuratObject") >= "5.0.0") {
-    # Seurat V5
-    tryCatch({
-      Ms <- as.matrix(SeuratObject::LayerData(seurat, assay = assay, layer = layer_s))
-      Mu <- as.matrix(SeuratObject::LayerData(seurat, assay = assay, layer = layer_u))
-    }, error = function(e) {
-      # Try data slot
-      Ms <- as.matrix(seurat[[assay]]@data)
-      Mu <- as.matrix(seurat[[assay]]@data)  
-    })
-  } else {
-    # Seurat V4
-    tryCatch({
-      Ms <- as.matrix(seurat[[assay]]@data)
-      Mu <- as.matrix(seurat[[assay]]@data)
-    }, error = function(e) {
-      stop("Could not extract expression data from Seurat object")
-    })
-  }
+  # Use get_layer_matrix for V4/V5 compatibility
+  Ms <- tryCatch({
+    get_layer_matrix(seurat, layer_s, assay = assay)
+  }, error = function(e) {
+    # Fallback: try scVeloR storage
+    if (!is.null(seurat@misc$scVeloR$Ms)) {
+      seurat@misc$scVeloR$Ms
+    } else if (!is.null(seurat@misc$spliced)) {
+      t(as.matrix(seurat@misc$spliced))
+    } else {
+      stop(sprintf("Could not find spliced data in layer '%s'", layer_s))
+    }
+  })
   
-  # Transpose to cells x genes
-  Ms <- t(Ms)
-  Mu <- t(Mu)
+  Mu <- tryCatch({
+    get_layer_matrix(seurat, layer_u, assay = assay)
+  }, error = function(e) {
+    # Fallback: try scVeloR storage
+    if (!is.null(seurat@misc$scVeloR$Mu)) {
+      seurat@misc$scVeloR$Mu
+    } else if (!is.null(seurat@misc$unspliced)) {
+      t(as.matrix(seurat@misc$unspliced))
+    } else {
+      stop(sprintf("Could not find unspliced data in layer '%s'", layer_u))
+    }
+  })
   
   # Get connectivities
   connectivities <- NULL
-  if ("neighbors" %in% names(seurat@graphs)) {
+  if (!is.null(seurat@misc$scVeloR$neighbors$connectivities)) {
+    connectivities <- seurat@misc$scVeloR$neighbors$connectivities
+  } else if ("neighbors" %in% names(seurat@graphs)) {
     connectivities <- seurat@graphs$neighbors
   } else if ("RNA_snn" %in% names(seurat@graphs)) {
     connectivities <- seurat@graphs$RNA_snn
