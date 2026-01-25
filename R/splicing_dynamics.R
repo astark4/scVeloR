@@ -359,8 +359,9 @@ assign_tau <- function(u, s, alpha, beta, gamma,
     s0_ <- sol$s
   }
   
-  use_projection <- assignment_mode %in% c("full_projection", "partial_projection") ||
-    (assignment_mode == "projection" && beta < gamma)
+  use_projection <- !is.null(assignment_mode) && 
+    (assignment_mode %in% c("full_projection", "partial_projection") ||
+    (assignment_mode == "projection" && beta < gamma))
   
   if (use_projection) {
     # Project observations onto trajectory curve
@@ -459,9 +460,15 @@ linreg <- function(u, s) {
     ss <- sum(s@x^2)
     us <- sum(s@x * u[which(s@x != 0)])
   } else {
-    ss <- sum(s^2)
-    us <- sum(s * u)
+    # Handle NA and non-finite values
+    valid <- is.finite(u) & is.finite(s) & (s != 0 | u != 0)
+    if (sum(valid) < 2) return(1)
+    u <- u[valid]
+    s <- s[valid]
+    ss <- sum(s^2, na.rm = TRUE)
+    us <- sum(s * u, na.rm = TRUE)
   }
+  if (ss == 0) return(1)
   us / ss
 }
 
@@ -469,7 +476,7 @@ linreg <- function(u, s) {
 #' 
 #' @description Multiply by weights (sparse-aware)
 #' @param x Values
-#' @param weights Weights (can be sparse)
+#' @param weights Weights (can be sparse or logical)
 #' @return Weighted values
 #' @keywords internal
 convolve_weights <- function(x, weights = NULL) {
@@ -478,6 +485,9 @@ convolve_weights <- function(x, weights = NULL) {
   }
   if (inherits(weights, "sparseMatrix")) {
     as.vector(weights %*% x)
+  } else if (is.logical(weights)) {
+    # Filter by logical weights
+    x[weights]
   } else {
     weights * x
   }

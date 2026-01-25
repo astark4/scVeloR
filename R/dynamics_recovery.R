@@ -92,8 +92,17 @@ DynamicsRecovery <- R6::R6Class(
       if (gamma > 1.5 / scaling) gamma <- gamma / 1.2
       
       # Initialize alpha
-      u_inf <- mean(u_w_scaled[weights_u | weights_s])
-      s_inf <- mean(s_w[weights_s])
+      selected <- weights_u | weights_s
+      if (sum(selected, na.rm = TRUE) == 0) {
+        selected <- rep(TRUE, length(u_w_scaled))
+      }
+      u_inf <- mean(u_w_scaled[selected], na.rm = TRUE)
+      s_inf <- mean(s_w[weights_s], na.rm = TRUE)
+      
+      # Handle edge cases
+      if (!is.finite(u_inf) || u_inf <= 0) u_inf <- max(u_w_scaled, na.rm = TRUE)
+      if (!is.finite(s_inf) || s_inf <= 0) s_inf <- max(s_w, na.rm = TRUE)
+      
       u0_ <- u_inf
       s0_ <- s_inf
       alpha <- u_inf * beta

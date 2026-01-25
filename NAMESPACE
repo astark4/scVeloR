@@ -60,7 +60,6 @@ export(velocity_streamlines)
 
 # Latent time and pseudotime
 export(latent_time)
-export(compute_latent_time)
 export(terminal_states)
 export(velocity_pseudotime)
 export(velocity_cell_cycle)
@@ -83,7 +82,20 @@ export(export_to_anndata)
 export(get_embedding)
 export(get_velocity_data)
 
-# C++ exports
+# Imports
+import(Matrix)
+import(methods)
+import(R6)
+
+importFrom(Rcpp, sourceCpp)
+importFrom(stats, optim, lm, coef, quantile, sd, median, density, dist, setNames, na.omit, prcomp, var, pchisq, pnorm)
+importFrom(utils, head, tail, packageVersion)
+importFrom(grDevices, colorRampPalette)
+
+# Load compiled C++ code
+useDynLib(scVeloR, .registration = TRUE)
+
+# C++ exports (from RcppExports)
 export(unspliced_cpp)
 export(spliced_cpp)
 export(mRNA_cpp)
@@ -101,27 +113,3 @@ export(col_var_cpp)
 export(weighted_corr_cpp)
 export(safe_divide_cpp)
 export(clamp_cpp)
-
-# Cosine similarity C++
-export(compute_cosine_similarity_cpp)
-export(compute_correlation_graph_cpp)
-
-# KNN C++
-export(knn_exact_cpp)
-export(compute_distances_cpp)
-
-# Moments C++
-export(compute_moments_cpp)
-
-# Imports
-import(Matrix)
-import(methods)
-import(R6)
-
-importFrom(Rcpp, sourceCpp)
-importFrom(stats, optim, lm, coef, quantile, sd, median, density, dist, setNames, na.omit, prcomp, var, pchisq, pnorm, scale)
-importFrom(utils, head, tail, packageVersion)
-importFrom(grDevices, colorRampPalette)
-
-# Load compiled C++ code
-useDynLib(scVeloR, .registration = TRUE)
