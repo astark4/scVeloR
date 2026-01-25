@@ -1,0 +1,56 @@
+Package: scVeloR
+Type: Package
+Title: RNA Velocity Analysis for Single-Cell RNA-Seq Data
+Version: 1.0.0
+Date: 2026-01-25
+Authors@R: c(
+    person("Zaoqu", "Liu", 
+           email = "liuzaoqu@163.com", 
+           role = c("aut", "cre"),
+           comment = c(ORCID = "0000-0002-0000-0000")))
+Description: A comprehensive R implementation of RNA velocity analysis for 
+    single-cell RNA sequencing data. This package provides methods for 
+    estimating RNA velocities using steady-state, stochastic, and dynamical 
+    models. It includes functions for velocity graph construction, embedding 
+    projection, transition matrix computation, and various visualization tools.
+    The package is optimized for performance using Rcpp and supports parallel 
+    computation via the future framework. Compatible with Seurat V4 and V5 objects.
+License: MIT + file LICENSE
+URL: https://github.com/Zaoqu-Liu/scVeloR
+BugReports: https://github.com/Zaoqu-Liu/scVeloR/issues
+Encoding: UTF-8
+LazyData: true
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.0
+Depends:
+    R (>= 4.0.0)
+Imports:
+    Seurat (>= 4.0.0),
+    SeuratObject (>= 4.0.0),
+    Matrix (>= 1.5.0),
+    Rcpp (>= 1.0.0),
+    ggplot2 (>= 3.4.0),
+    future,
+    future.apply,
+    progressr,
+    FNN,
+    uwot,
+    irlba,
+    scales,
+    grDevices,
+    stats,
+    methods,
+    utils
+LinkingTo:
+    Rcpp,
+    RcppArmadillo
+Suggests:
+    testthat (>= 3.0.0),
+    knitr,
+    rmarkdown,
+    covr,
+    BiocStyle
+VignetteBuilder: knitr
+Config/testthat/edition: 3
+NeedsCompilation: yes
+SystemRequirements: C++11

@@ -1,0 +1,34 @@
+# R files
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Compiled files
+src/*.o
+src/*.so
+src/*.dll
+src/RcppExports.cpp
+R/RcppExports.R
+
+# Package build files
+*.tar.gz
+*.Rcheck/
+
+# IDE files
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation
+docs/
+inst/doc/
+
+# Test artifacts
+tests/testthat/_snaps/

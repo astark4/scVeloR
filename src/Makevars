@@ -1,0 +1,13 @@
+# scVeloR Makevars - Cross-platform compilation without OpenMP
+# Author: Zaoqu Liu
+
+PKG_CXXFLAGS = $(SHLIB_OPENMP_CXXFLAGS) -I../inst/include
+PKG_LIBS = $(SHLIB_OPENMP_CXXFLAGS) $(LAPACK_LIBS) $(BLAS_LIBS) $(FLIBS)
+
+# Use C++11 standard
+CXX_STD = CXX11
+
+# Disable OpenMP to avoid conflicts
+# If you need OpenMP, uncomment the lines below:
+# PKG_CXXFLAGS += -fopenmp
+# PKG_LIBS += -fopenmp

@@ -1,0 +1,270 @@
+---
+title: "scVeloR: RNA Velocity Analysis in R"
+author: "Zaoqu Liu"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{scVeloR: RNA Velocity Analysis in R}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+## Introduction
+
+**scVeloR** is a comprehensive R implementation of RNA velocity analysis for single-cell RNA sequencing data. RNA velocity leverages the ratio of unspliced to spliced mRNA to predict the future transcriptional state of individual cells, enabling inference of cellular dynamics directly from standard scRNA-seq data.
+
+This package provides:
+
+- Three velocity estimation models (steady-state, stochastic, dynamical)
+- Full integration with Seurat objects (V4 and V5)
+- Rcpp-accelerated core computations
+- Cross-platform parallel computing
+- Rich visualization tools
+
+## Installation
+
+```{r install, eval=FALSE}
+# Install from GitHub
+if (!require("remotes")) install.packages("remotes")
+remotes::install_github("Zaoqu-Liu/scVeloR")
+```
+
+## Quick Start Workflow
+
+### Load packages
+
+```{r load, eval=FALSE}
+library(scVeloR)
+library(Seurat)
+library(ggplot2)
+```
+
+### Prepare your data
+
+Your Seurat object needs to contain:
+
+1. **Spliced counts** - mature mRNA
+2. **Unspliced counts** - nascent/pre-mRNA
+3. **Dimensional reduction** - UMAP or tSNE coordinates
+
+```{r data_prep, eval=FALSE}
+# Example: Loading from velocyto loom output
+# seurat_obj <- Read10X_h5("filtered_feature_bc_matrix.h5")
+# Or use existing Seurat object with spliced/unspliced assays
+```
+
+### Step 1: Preprocessing
+
+```{r preprocess, eval=FALSE}
+# Filter genes and normalize
+seurat_obj <- filter_and_normalize(seurat_obj,
+                                    min_counts = 10,
+                                    min_cells = 10,
+                                    min_counts_u = 5,
+                                    min_cells_u = 5)
+
+# Show proportions
+show_proportions(seurat_obj)
+```
+
+### Step 2: Compute Moments
+
+Moments smooth expression values across neighboring cells:
+
+```{r moments, eval=FALSE}
+# Compute neighbor graph if not present
+seurat_obj <- compute_neighbors(seurat_obj, n_neighbors = 30)
+
+# Compute first-order moments (smoothed expression)
+seurat_obj <- compute_moments(seurat_obj, n_neighbors = 30)
+```
+
+### Step 3: Velocity Estimation
+
+Choose one of three models:
+
+#### Steady-State Model (Fastest)
+
+Assumes cells are at equilibrium:
+
+```{r steady, eval=FALSE}
+seurat_obj <- velocity(seurat_obj, mode = "steady_state")
+```
+
+#### Stochastic Model (Recommended)
+
+Uses second-order moments for more robust estimation:
+
+```{r stochastic, eval=FALSE}
+seurat_obj <- velocity(seurat_obj, mode = "stochastic")
+```
+
+#### Dynamical Model (Most Accurate)
+
+Fits full splicing kinetics using EM algorithm:
+
+```{r dynamical, eval=FALSE}
+# First recover dynamics
+seurat_obj <- recover_dynamics(seurat_obj, 
+                                var_names = "velocity_genes",
+                                max_iter = 10)
+
+# Then compute velocity
+seurat_obj <- velocity(seurat_obj, mode = "dynamical")
+
+# Recover latent time
+seurat_obj <- recover_latent_time(seurat_obj)
+```
+
+### Step 4: Velocity Graph
+
+Compute transitions between cells:
+
+```{r graph, eval=FALSE}
+seurat_obj <- compute_velocity_graph(seurat_obj,
+                                      sqrt_transform = TRUE)
+```
+
+### Step 5: Project to Embedding
+
+Project velocities onto UMAP/tSNE:
+
+```{r project, eval=FALSE}
+seurat_obj <- project_velocity_embedding(seurat_obj,
+                                          basis = "umap",
+                                          scale = 10)
+```
+
+### Step 6: Visualization
+
+#### Velocity Embedding Plot
+
+```{r plot_emb, eval=FALSE}
+velocity_embedding_plot(seurat_obj, 
+                        basis = "umap",
+                        color_by = "clusters",
+                        arrow_size = 1,
+                        density = 0.5)
+```
+
+#### Stream Plot
+
+```{r plot_stream, eval=FALSE}
+velocity_stream_plot(seurat_obj,
+                     basis = "umap",
+                     density = 1,
+                     smooth = 0.5)
+```
+
+#### Grid Plot
+
+```{r plot_grid, eval=FALSE}
+velocity_grid_plot(seurat_obj,
+                   basis = "umap",
+                   n_grid = 40)
+```
+
+#### Phase Portrait
+
+```{r phase, eval=FALSE}
+# Plot specific genes
+plot_phase_portrait(seurat_obj,
+                    genes = c("Sox2", "Neurod1", "Tubb3"),
+                    color_by = "clusters")
+```
+
+#### Heatmap
+
+```{r heatmap, eval=FALSE}
+velocity_heatmap(seurat_obj,
+                 n_genes = 50,
+                 order_by = "velocity_pseudotime")
+```
+
+## Parallel Computing
+
+scVeloR supports parallel computation via the `future` framework:
+
+```{r parallel, eval=FALSE}
+library(future)
+
+# Use multiple cores
+plan(multisession, workers = 4)
+
+# Run computations
+seurat_obj <- velocity(seurat_obj, mode = "stochastic")
+seurat_obj <- compute_velocity_graph(seurat_obj)
+
+# Reset to sequential
+plan(sequential)
+```
+
+## Terminal States and Pseudotime
+
+```{r terminal, eval=FALSE}
+# Identify terminal states
+seurat_obj <- terminal_states(seurat_obj, groupby = "clusters")
+
+# Compute velocity pseudotime
+seurat_obj <- velocity_pseudotime(seurat_obj)
+
+# Plot pseudotime
+velocity_scatter(seurat_obj, 
+                 x = "UMAP_1", 
+                 y = "UMAP_2",
+                 color_by = "velocity_pseudotime")
+```
+
+## Gene Ranking
+
+```{r ranking, eval=FALSE}
+# Rank genes by velocity fit quality
+top_genes <- rank_velocity_genes(seurat_obj, n_genes = 20)
+print(top_genes)
+
+# Get velocity genes
+vg <- velocity_genes(seurat_obj, min_r2 = 0.05)
+```
+
+## Quality Metrics
+
+```{r metrics, eval=FALSE}
+# Compute confidence scores
+seurat_obj <- velocity_confidence(seurat_obj)
+
+# Plot metrics
+plot_velocity_metrics(seurat_obj)
+```
+
+## Model Selection Guide
+
+| Model | Speed | Accuracy | When to Use |
+|-------|-------|----------|-------------|
+| Steady-state | Fast | Good | Quick exploration, large datasets |
+| Stochastic | Medium | Better | Default choice, most datasets |
+| Dynamical | Slow | Best | Publication-quality, complex dynamics |
+
+## Session Info
+
+```{r session, eval=FALSE}
+sessionInfo()
+```
+
+## References
+
+- Bergen et al. (2020). Generalizing RNA velocity to transient cell states through dynamical modeling. *Nature Biotechnology*.
+- La Manno et al. (2018). RNA velocity of single cells. *Nature*.
+
+## Support
+
+- GitHub Issues: https://github.com/Zaoqu-Liu/scVeloR/issues
+- Email: liuzaoqu@163.com
