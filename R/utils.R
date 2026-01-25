@@ -213,15 +213,24 @@ safe_div <- function(a, b, default = 0) {
 vcorrcoef <- function(x, Y) {
   n <- length(x)
   
-  # Center
+  # Center x
   x_c <- x - mean(x)
-  Y_c <- Y - colMeans(Y)
   
-  # Correlation
+  # Center Y columns (sweep subtracts column means from each column)
+  Y_means <- colMeans(Y)
+  Y_c <- sweep(Y, 2, Y_means, "-")
+  
+  # Compute standard deviations
   x_sd <- sqrt(sum(x_c^2))
   Y_sd <- sqrt(colSums(Y_c^2))
   
-  colSums(x_c * Y_c) / (x_sd * Y_sd)
+  # Compute correlations
+  result <- colSums(x_c * Y_c) / (x_sd * Y_sd)
+  
+  # Handle division by zero
+  result[!is.finite(result)] <- 0
+  
+  result
 }
 
 #' Print Object Size
