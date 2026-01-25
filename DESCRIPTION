@@ -20,7 +20,8 @@ Description: A comprehensive R implementation of RNA velocity analysis based on
     integrates seamlessly with Seurat objects and provides visualization 
     functions for velocity embedding, stream plots, and phase portraits.
 License: MIT + file LICENSE
-URL: https://github.com/Zaoqu-Liu/scVeloR
+URL: https://github.com/Zaoqu-Liu/scVeloR,
+    https://zaoqu-liu.github.io/scVeloR/
 BugReports: https://github.com/Zaoqu-Liu/scVeloR/issues
 Encoding: UTF-8
 LazyData: true
