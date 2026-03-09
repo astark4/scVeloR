@@ -317,15 +317,15 @@ get_layer_matrix <- function(object, layer_name, assay = NULL) {
   if (version == 5) {
     # Seurat V5: Use LayerData
     tryCatch({
-      available_layers <- Seurat::Layers(object, assay = assay)
+      available_layers <- SeuratObject::Layers(object, assay = assay)
       
       if (layer_name %in% available_layers) {
-        mat <- Seurat::LayerData(object, layer = layer_name, assay = assay)
+        mat <- SeuratObject::LayerData(object, layer = layer_name, assay = assay)
       } else {
         # Try to find similar layer name
         matched <- grep(layer_name, available_layers, ignore.case = TRUE, value = TRUE)
         if (length(matched) > 0) {
-          mat <- Seurat::LayerData(object, layer = matched[1], assay = assay)
+          mat <- SeuratObject::LayerData(object, layer = matched[1], assay = assay)
           message(sprintf("Note: Using layer '%s' instead of '%s'", matched[1], layer_name))
         }
       }
